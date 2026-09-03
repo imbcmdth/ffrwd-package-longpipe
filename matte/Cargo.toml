@@ -1,0 +1,11 @@
+[package]
+name = "matte"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "matte"
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.57.1"

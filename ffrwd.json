@@ -1,0 +1,41 @@
+{
+  "name": "ffrwd/longpipe",
+  "version": "0.1.0",
+  "description": "Whole-frame foreground matting with longpipe's small net, hosted in wasm: one grayscale alpha matte per frame, and recipes that blur the background, replace it, or carry the picture with its alpha. Everything downstream is native ffmpeg. The model is sb2702/longpipe's work (MIT, code and weights), converted to ONNX and fetched at install.",
+  "license": "MIT",
+  "homepage": "https://github.com/imbcmdth/ffrwd-package-longpipe",
+  "capabilities": [
+    "nn"
+  ],
+  "dependencies": {
+    "ffrwd/wasm": "0.12.0",
+    "ffrwd/mask_tools": "1.0.3"
+  },
+  "keywords": [
+    "matting",
+    "matte",
+    "alpha",
+    "background",
+    "blur",
+    "greenscreen",
+    "portrait",
+    "nn"
+  ],
+  "lib": {
+    "matte": "src/model.sql"
+  },
+  "bin": {
+    "background-blur": "recipes/background-blur.sql",
+    "background-replace": "recipes/background-replace.sql",
+    "greenscreen": "recipes/greenscreen.sql",
+    "matte": "recipes/matte.sql"
+  },
+  "models": {
+    "matte": {
+      "repo": "imbcmdth/longpipe-onnx",
+      "revision": "750fcb27b23f1d9e1b0f9758d1dc8830655d5a35",
+      "file": "matting_xl_f32.onnx",
+      "sha256": "996cf2779c5b7c690b35ee1ef5e8890f8d2497e12dea97dc13ddd18e4132d04c"
+    }
+  }
+}
