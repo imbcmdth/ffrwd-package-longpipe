@@ -2,15 +2,28 @@
 //! foreground - 255 where the subject owns the pixel, 0 where the background
 //! does, and the values between are the blend.
 //!
-//! The graph is longpipe's small matting net, run through `wasi:nn` at its
-//! fixed 320x192 input. The net has no classes: its one output is the
-//! foreground alpha, so there is nothing to narrow and no parameters to
-//! take. The frame is stretch-resized to the model's size - no letterbox, no
-//! crop, the way the runtime the weights shipped in feeds it - as RGB
-//! rescaled to 0..1 with no further normalization, and the alpha that comes
-//! back is resized bilinearly onto the frame's own geometry. The module
-//! never opens a file - the host binds the graph to a name with
-//! `-nn matte=<path>` and this module asks for that name and nothing else.
+//! The graph is longpipe's fused temporal xl export, run through `wasi:nn`
+//! at its fixed 1280x768 canvas. One compute takes the frame beside the
+//! previous frame's state - that frame at the flow half's base resolution,
+//! its four encoder taps, and the stabilizer carrier - and answers the
+//! stabilized alpha along with that state refreshed. The module holds the
+//! state between calls and feeds it back, so each matte is steadied against
+//! the frame before it. A call therefore depends on more than it was
+//! handed, and the module says so: it is impure, hosted one call at a time,
+//! in order.
+//!
+//! The first frame of an instance has no previous frame. Its state is all
+//! zeros, its matte is the graph's raw alpha, and that alpha seeds the
+//! carrier beside a zero envelope - the cold start the export was built
+//! around. A new stream opens a new instance, so a discontinuity starts
+//! fresh.
+//!
+//! The frame is stretch-resized to the canvas - no letterbox, no crop, each
+//! axis by its own ratio - as RGB rescaled to 0..1 with no further
+//! normalization, and the alpha that comes back is resized bilinearly onto
+//! the frame's own geometry. The module never opens a file - the host binds
+//! the graph to a name with `-nn matte=<path>` and this module asks for that
+//! name and nothing else.
 //!
 //! The matte keeps the frame's geometry and pixel format, so it feeds
 //! straight into whatever reads a mask beside the picture: in yuv420p the
@@ -27,7 +40,7 @@ wit_bindgen::generate!({
     generate_all,
 });
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 
 use exports::ffrwd::av::window_filter::{
     Format, FramePayload, Guest, InWindow, Meta, OutFrame, Processed, StreamInfo, WindowMeta,
@@ -39,19 +52,62 @@ use wasi::nn::tensor::{Tensor, TensorType};
 /// The name the host binds the graph to. `-nn matte=<path>`.
 const MODEL: &str = "matte";
 
-/// The size the graph is exported at, fixed: the TF-style pads inside it
-/// trace to constants, so the export carries exactly one geometry.
-const MODEL_W: usize = 320;
-const MODEL_H: usize = 192;
+/// The canvas the graph is exported at, fixed: the frame input, both alphas
+/// and the stabilizer carrier all share it.
+const CANVAS_W: usize = 1280;
+const CANVAS_H: usize = 768;
 
-/// What the export calls its input tensor.
-const INPUT_NAME: &str = "rgb";
+/// What the export calls its frame input.
+const FRAME_IN: &str = "frame";
 
-/// The host accepts a position where it accepts a name, which is what an
-/// export that named its input something else is reached by.
-const INPUT_INDEX: &str = "0";
+/// The cross-frame inputs, in the export's order: the previous frame at the
+/// flow half's base resolution, its four encoder taps, and the stabilizer
+/// carrier - alpha beside envelope.
+const STATE_IN: [&str; 6] = [
+    "prev_frame_base",
+    "prev_tap0",
+    "prev_tap1",
+    "prev_tap2",
+    "prev_tap3",
+    "prev_stab",
+];
+
+/// The refreshed state the graph answers with, matching `STATE_IN` slot for
+/// slot. The carrier is not here: a warm frame reads `stab_state`, and the
+/// first frame seeds it from the raw alpha instead.
+const STATE_OUT: [&str; 5] = [
+    "cur_frame_base",
+    "cur_tap0",
+    "cur_tap1",
+    "cur_tap2",
+    "cur_tap3",
+];
+
+/// Each state tensor's shape, in `STATE_IN` order, shared by the output that
+/// refreshes it.
+const STATE_DIMS: [[u32; 4]; 6] = [
+    [1, 3, 192, 320],
+    [1, 32, 48, 80],
+    [1, 48, 24, 40],
+    [1, 136, 12, 20],
+    [1, 384, 6, 10],
+    [1, 2, CANVAS_H as u32, CANVAS_W as u32],
+];
+
+/// The alphas the graph answers with: stabilized for a warm frame, raw for
+/// the first, which has nothing to stabilize against.
+const ALPHA_STAB: &str = "alpha_stab";
+const ALPHA_RAW: &str = "alpha_raw";
+
+/// The refreshed carrier a warm frame reads back.
+const STAB_STATE: &str = "stab_state";
 
 const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
+
+/// A shape's length as the little-endian fp32 bytes it travels in.
+fn bytes_of(dims: &[u32]) -> usize {
+    dims.iter().map(|d| *d as usize).product::<usize>() * 4
+}
 
 /// The pixel format an instance was opened for, fixed for its life.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -71,13 +127,32 @@ impl PixFmt {
     }
 }
 
-/// What `init` settled, plus the graph it loaded.
+/// The tensors carried from one frame to the next, as the bytes they travel
+/// in, in `STATE_IN` order. `warm` says whether any frame has run: until one
+/// has, the tensors are zeros and the carrier has nothing to steady against.
+struct State {
+    tensors: [Vec<u8>; 6],
+    warm: bool,
+}
+
+impl State {
+    /// Every tensor zero - an fp32 zero is four zero bytes.
+    fn cold() -> State {
+        State {
+            tensors: STATE_DIMS.map(|dims| vec![0u8; bytes_of(&dims)]),
+            warm: false,
+        }
+    }
+}
+
+/// What `init` settled, plus the graph it loaded and the state the stream
+/// has reached.
 struct Opened {
     width: usize,
     height: usize,
     pix_fmt: PixFmt,
-    /// What the graph calls its input, settled by the first call that works.
-    input_name: Cell<&'static str>,
+    /// Carried across `process` calls and fed back into every compute.
+    state: State,
     /// Held for the life of the instance: building it once is what keeps a
     /// provider's kernels from being chosen again per frame.
     context: GraphExecutionContext,
@@ -183,11 +258,11 @@ fn row_to_rgb(frame: &[u8], pix_fmt: PixFmt, width: usize, height: usize, y: usi
     }
 }
 
-/// One frame row resized to the model's columns, channel by channel.
+/// One frame row resized to the canvas's columns, channel by channel.
 fn resize_rgb_row(rgb: &[f32], columns: &Taps, width: usize, out: &mut [f32]) {
     for channel in 0..3 {
         let source = &rgb[channel * width..(channel + 1) * width];
-        let target = &mut out[channel * MODEL_W..(channel + 1) * MODEL_W];
+        let target = &mut out[channel * CANVAS_W..(channel + 1) * CANVAS_W];
         for (((sample, low), high), fraction) in target
             .iter_mut()
             .zip(&columns.low)
@@ -200,21 +275,21 @@ fn resize_rgb_row(rgb: &[f32], columns: &Taps, width: usize, out: &mut [f32]) {
     }
 }
 
-/// The frame stretched to the model's 320x192 - each axis by its own ratio,
+/// The frame stretched to the 1280x768 canvas - each axis by its own ratio,
 /// no letterbox, the contract the weights shipped with - and laid out as the
 /// planar fp32 tensor the graph expects: red, green and blue in turn, each
 /// rescaled to 0..1 and nothing else.
 fn to_input(frame: &[u8], pix_fmt: PixFmt, width: usize, height: usize) -> Vec<u8> {
-    let plane = MODEL_W * MODEL_H;
+    let plane = CANVAS_W * CANVAS_H;
     let mut planes = vec![0f32; plane * 3];
 
-    let columns = Taps::build(MODEL_W, width);
-    let rows = Taps::build(MODEL_H, height);
+    let columns = Taps::build(CANVAS_W, width);
+    let rows = Taps::build(CANVAS_H, height);
     let mut rgb = vec![0f32; width * 3];
-    let mut top = vec![0f32; MODEL_W * 3];
-    let mut bottom = vec![0f32; MODEL_W * 3];
+    let mut top = vec![0f32; CANVAS_W * 3];
+    let mut bottom = vec![0f32; CANVAS_W * 3];
 
-    for my in 0..MODEL_H {
+    for my in 0..CANVAS_H {
         row_to_rgb(frame, pix_fmt, width, height, rows.low[my], &mut rgb);
         resize_rgb_row(&rgb, &columns, width, &mut top);
         if rows.high[my] != rows.low[my] {
@@ -226,9 +301,9 @@ fn to_input(frame: &[u8], pix_fmt: PixFmt, width: usize, height: usize) -> Vec<u
         let ty = rows.fraction[my];
 
         for channel in 0..3 {
-            let a = &top[channel * MODEL_W..(channel + 1) * MODEL_W];
-            let b = &bottom[channel * MODEL_W..(channel + 1) * MODEL_W];
-            let target = &mut planes[channel * plane + my * MODEL_W..][..MODEL_W];
+            let a = &top[channel * CANVAS_W..(channel + 1) * CANVAS_W];
+            let b = &bottom[channel * CANVAS_W..(channel + 1) * CANVAS_W];
+            let target = &mut planes[channel * plane + my * CANVAS_W..][..CANVAS_W];
             for ((sample, ta), tb) in target.iter_mut().zip(a).zip(b) {
                 *sample = (ta + (tb - ta) * ty).clamp(0.0, 255.0) / 255.0;
             }
@@ -249,35 +324,58 @@ fn le_f32s(data: &[u8]) -> Vec<f32> {
     whole.iter().copied().map(f32::from_le_bytes).collect()
 }
 
-/// Which returned tensor is the alpha, by shape: the one whose trailing two
-/// dimensions are the model's own 192x320 plane and whose leading ones are
-/// all 1. Names are not read, so an export that spells its output
-/// differently still resolves.
-fn output(shapes: &[Vec<u32>]) -> Result<usize, String> {
-    let alpha = shapes.iter().position(|dimensions| {
-        matches!(dimensions.as_slice(),
-            [rest @ .., height, width]
-                if *height as usize == MODEL_H
-                    && *width as usize == MODEL_W
-                    && rest.iter().all(|d| *d == 1))
-    });
-    alpha.ok_or_else(|| {
-        format!(
-            "matte: the graph returned {shapes:?}, and this module wants the \
-             [1, 1, {MODEL_H}, {MODEL_W}] alpha of longpipe's small export"
-        )
-    })
+/// The named tensor out of what a compute answered, checked against the byte
+/// length its shape fixes: these bytes are fed back next frame, so a wrong
+/// size is refused here rather than corrupting every frame after it.
+fn take(outputs: &mut Vec<(String, Vec<u8>)>, name: &str, len: usize) -> Result<Vec<u8>, String> {
+    let Some(at) = outputs.iter().position(|(n, _)| n == name) else {
+        let unclaimed: Vec<&str> = outputs.iter().map(|(n, _)| n.as_str()).collect();
+        return Err(format!(
+            "matte: the graph answered without {name:?} (unclaimed: {unclaimed:?}); \
+             this module wants longpipe's fused temporal export"
+        ));
+    };
+    let (_, bytes) = outputs.swap_remove(at);
+    if bytes.len() != len {
+        return Err(format!(
+            "matte: {name} came back as {} bytes where its shape fixes {len}",
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
 }
 
-/// The model's alpha brought onto the frame's own geometry, bilinearly, as
+/// One compute's answer folded into the state, returning the alpha this
+/// frame shows. A warm frame shows `alpha_stab` and carries `stab_state`;
+/// the first frame shows `alpha_raw` and seeds the carrier with it beside a
+/// zero envelope, the way the export's cold start is defined.
+fn advance(state: &mut State, mut outputs: Vec<(String, Vec<u8>)>) -> Result<Vec<u8>, String> {
+    let plane = CANVAS_W * CANVAS_H * 4;
+    let raw = take(&mut outputs, ALPHA_RAW, plane)?;
+    for (i, name) in STATE_OUT.iter().enumerate() {
+        state.tensors[i] = take(&mut outputs, name, bytes_of(&STATE_DIMS[i]))?;
+    }
+    if state.warm {
+        state.tensors[5] = take(&mut outputs, STAB_STATE, 2 * plane)?;
+        take(&mut outputs, ALPHA_STAB, plane)
+    } else {
+        state.warm = true;
+        let mut carrier = raw.clone();
+        carrier.resize(2 * plane, 0);
+        state.tensors[5] = carrier;
+        Ok(raw)
+    }
+}
+
+/// The graph's alpha brought onto the frame's own geometry, bilinearly, as
 /// 8-bit gray.
 fn upscale_alpha(alpha: &[f32], width: usize, height: usize) -> Vec<u8> {
-    let columns = Taps::build(width, MODEL_W);
-    let rows = Taps::build(height, MODEL_H);
+    let columns = Taps::build(width, CANVAS_W);
+    let rows = Taps::build(height, CANVAS_H);
     let mut map = vec![0u8; width * height];
     for y in 0..height {
-        let top = &alpha[rows.low[y] * MODEL_W..][..MODEL_W];
-        let bottom = &alpha[rows.high[y] * MODEL_W..][..MODEL_W];
+        let top = &alpha[rows.low[y] * CANVAS_W..][..CANVAS_W];
+        let bottom = &alpha[rows.high[y] * CANVAS_W..][..CANVAS_W];
         let ty = rows.fraction[y];
         let target = &mut map[y * width..][..width];
         for (x, slot) in target.iter_mut().enumerate() {
@@ -310,37 +408,30 @@ fn to_frame(map: &[u8], pix_fmt: PixFmt, width: usize, height: usize, len: usize
     out
 }
 
-/// One frame through the graph, however the graph names its input.
-fn compute(opened: &Opened, input: &[u8]) -> Result<Vec<(String, Tensor)>, String> {
-    let dimensions = [1, 3, MODEL_H as u32, MODEL_W as u32];
-    let name = opened.input_name.get();
-    let tensor = Tensor::new(&dimensions, TensorType::Fp32, input);
-    match opened.context.compute(vec![(name.to_string(), tensor)]) {
-        Ok(returned) => Ok(returned),
-        // An export whose input is not called what this one calls it. The
-        // host takes a position where it takes a name, so the retry names
-        // none, and the name that worked is kept for every frame after this
-        // one.
-        Err(_) if name == INPUT_NAME => {
-            opened.input_name.set(INPUT_INDEX);
-            let tensor = Tensor::new(&dimensions, TensorType::Fp32, input);
-            opened
-                .context
-                .compute(vec![(INPUT_INDEX.to_string(), tensor)])
-                .map_err(|e| failed("compute", &e))
-        }
-        Err(e) => Err(failed("compute", &e)),
-    }
-}
-
-/// One frame in, its matte out.
-fn run(opened: &Opened, frame: &[u8], len: usize) -> Result<Vec<u8>, String> {
+/// One frame through the graph: the frame stretched to canvas beside the
+/// carried state, the state refreshed from the answer, the alpha brought
+/// onto the frame's own geometry.
+fn run(opened: &mut Opened, frame: &[u8], len: usize) -> Result<Vec<u8>, String> {
     let input = to_input(frame, opened.pix_fmt, opened.width, opened.height);
-    let returned = compute(opened, &input)?;
-    let tensors: Vec<Tensor> = returned.into_iter().map(|(_, tensor)| tensor).collect();
-    let shapes: Vec<Vec<u32>> = tensors.iter().map(Tensor::dimensions).collect();
-    let alpha = output(&shapes)?;
-    let map = upscale_alpha(&le_f32s(&tensors[alpha].data()), opened.width, opened.height);
+    let mut feeds = Vec::with_capacity(1 + STATE_IN.len());
+    let frame_dims = [1, 3, CANVAS_H as u32, CANVAS_W as u32];
+    feeds.push((
+        FRAME_IN.to_string(),
+        Tensor::new(&frame_dims, TensorType::Fp32, &input),
+    ));
+    for ((name, dims), bytes) in STATE_IN.iter().zip(&STATE_DIMS).zip(&opened.state.tensors) {
+        feeds.push((name.to_string(), Tensor::new(dims, TensorType::Fp32, bytes)));
+    }
+    let returned = opened
+        .context
+        .compute(feeds)
+        .map_err(|e| failed("compute", &e))?;
+    let outputs: Vec<(String, Vec<u8>)> = returned
+        .into_iter()
+        .map(|(name, tensor)| (name, tensor.data()))
+        .collect();
+    let alpha = advance(&mut opened.state, outputs)?;
+    let map = upscale_alpha(&le_f32s(&alpha), opened.width, opened.height);
     Ok(to_frame(
         &map,
         opened.pix_fmt,
@@ -368,7 +459,9 @@ impl Guest for Matte {
             },
             window: 1,
             stride: 1,
-            pure: true,
+            // Each call reads the state the one before it left, so calls
+            // happen one at a time, in order.
+            pure: false,
             one_to_one: true,
             reads_rows: false,
             forwards_rows: false,
@@ -397,7 +490,7 @@ impl Guest for Matte {
                 width: video.width as usize,
                 height: video.height as usize,
                 pix_fmt,
-                input_name: Cell::new(INPUT_NAME),
+                state: State::cold(),
                 context,
                 _graph: graph,
             });
@@ -414,9 +507,9 @@ impl Guest for Matte {
         // frame is ever left over.
         let mut out = Vec::with_capacity(window.len() as usize);
         OPENED.with(|opened| {
-            let borrowed = opened.borrow();
+            let mut borrowed = opened.borrow_mut();
             let opened = borrowed
-                .as_ref()
+                .as_mut()
                 .expect("init loads the graph before any frame arrives");
             for i in 0..window.len() {
                 let frame = window.fetch(i);
@@ -465,11 +558,11 @@ mod tests {
     }
 
     #[test]
-    fn the_input_is_the_models_own_plane_count_and_size() {
+    fn the_input_is_the_canvas_plane_count_and_size() {
         let (width, height) = (8usize, 8usize);
         let frame = vec![0u8; width * height * 4];
         let bytes = to_input(&frame, PixFmt::Rgba, width, height);
-        assert_eq!(bytes.len(), 3 * MODEL_H * MODEL_W * 4);
+        assert_eq!(bytes.len(), 3 * CANVAS_H * CANVAS_W * 4);
     }
 
     #[test]
@@ -505,19 +598,19 @@ mod tests {
 
     #[test]
     fn a_flat_alpha_upscales_flat_and_rounds_to_full() {
-        let alpha = vec![1.0f32; MODEL_W * MODEL_H];
+        let alpha = vec![1.0f32; CANVAS_W * CANVAS_H];
         let map = upscale_alpha(&alpha, 33, 17);
         assert!(map.iter().all(|v| *v == 255));
-        let none = vec![0.0f32; MODEL_W * MODEL_H];
+        let none = vec![0.0f32; CANVAS_W * CANVAS_H];
         assert!(upscale_alpha(&none, 33, 17).iter().all(|v| *v == 0));
     }
 
     #[test]
     fn an_alpha_edge_upscales_as_a_monotonic_ramp() {
         // Left half 0, right half 1: each output row must never step down.
-        let mut alpha = vec![0.0f32; MODEL_W * MODEL_H];
-        for row in alpha.chunks_exact_mut(MODEL_W) {
-            for value in &mut row[MODEL_W / 2..] {
+        let mut alpha = vec![0.0f32; CANVAS_W * CANVAS_H];
+        for row in alpha.chunks_exact_mut(CANVAS_W) {
+            for value in &mut row[CANVAS_W / 2..] {
                 *value = 1.0;
             }
         }
@@ -550,16 +643,93 @@ mod tests {
         }
     }
 
+    /// The full answer a compute returns, each tensor filled with its own
+    /// byte so a test can see which one landed where. `flow` rides along
+    /// unclaimed, as it does in the real answer.
+    fn answered() -> Vec<(String, Vec<u8>)> {
+        let plane = CANVAS_W * CANVAS_H * 4;
+        let mut outputs = vec![
+            (ALPHA_STAB.to_string(), vec![2u8; plane]),
+            (ALPHA_RAW.to_string(), vec![1u8; plane]),
+            ("flow".to_string(), vec![9u8; 2 * 48 * 80 * 4]),
+            (STAB_STATE.to_string(), vec![3u8; 2 * plane]),
+        ];
+        for (i, name) in STATE_OUT.iter().enumerate() {
+            outputs.push((name.to_string(), vec![10 + i as u8; bytes_of(&STATE_DIMS[i])]));
+        }
+        outputs
+    }
+
     #[test]
-    fn the_alpha_tensor_is_found_by_shape() {
-        assert_eq!(output(&[vec![1, 1, 192, 320]]).expect("found"), 0);
-        // Beside something else, in either order.
-        assert_eq!(
-            output(&[vec![1, 4, 96, 160], vec![1, 1, 192, 320]]).expect("found"),
-            1
+    fn a_cold_state_is_zeros_in_the_exports_shapes() {
+        let state = State::cold();
+        assert!(!state.warm);
+        for (tensor, dims) in state.tensors.iter().zip(&STATE_DIMS) {
+            assert_eq!(tensor.len(), bytes_of(dims));
+            assert!(tensor.iter().all(|b| *b == 0));
+        }
+    }
+
+    #[test]
+    fn the_first_frame_shows_the_raw_matte_and_seeds_the_carrier() {
+        let mut state = State::cold();
+        let alpha = advance(&mut state, answered()).expect("advances");
+        assert!(
+            alpha.iter().all(|b| *b == 1),
+            "the raw alpha, not the stabilized one"
         );
-        let error = output(&[vec![1, 1, 320, 192]]).expect_err("transposed is not the alpha");
-        assert!(error.starts_with("matte: "), "{error}");
+        assert!(state.warm);
+        let plane = CANVAS_W * CANVAS_H * 4;
+        assert!(
+            state.tensors[5][..plane].iter().all(|b| *b == 1),
+            "the carrier's alpha lane is the raw matte"
+        );
+        assert!(
+            state.tensors[5][plane..].iter().all(|b| *b == 0),
+            "beside a zero envelope"
+        );
+        for (i, tensor) in state.tensors[..5].iter().enumerate() {
+            assert!(
+                tensor.iter().all(|b| *b == 10 + i as u8),
+                "state slot {i} is the refreshed tensor"
+            );
+        }
+    }
+
+    #[test]
+    fn a_warm_frame_shows_the_stabilized_matte_and_reads_the_carrier_back() {
+        let mut state = State::cold();
+        advance(&mut state, answered()).expect("the cold frame");
+        let alpha = advance(&mut state, answered()).expect("the warm one");
+        assert!(alpha.iter().all(|b| *b == 2), "the stabilized alpha");
+        assert!(
+            state.tensors[5].iter().all(|b| *b == 3),
+            "the carrier is stab_state now"
+        );
+    }
+
+    #[test]
+    fn an_answer_missing_a_state_tensor_is_refused_by_name() {
+        let mut state = State::cold();
+        let outputs: Vec<_> = answered()
+            .into_iter()
+            .filter(|(name, _)| name != "cur_tap2")
+            .collect();
+        let error = advance(&mut state, outputs).expect_err("cur_tap2 is gone");
+        assert!(error.contains("cur_tap2"), "{error}");
+    }
+
+    #[test]
+    fn a_state_tensor_of_the_wrong_size_is_refused() {
+        let mut state = State::cold();
+        let mut outputs = answered();
+        let at = outputs
+            .iter()
+            .position(|(name, _)| name == "cur_frame_base")
+            .expect("present");
+        outputs[at].1.truncate(16);
+        let error = advance(&mut state, outputs).expect_err("truncated");
+        assert!(error.contains("cur_frame_base"), "{error}");
     }
 
     #[test]

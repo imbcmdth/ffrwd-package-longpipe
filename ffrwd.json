@@ -33,9 +33,9 @@
   "models": {
     "matte": {
       "repo": "imbcmdth/longpipe-onnx",
-      "revision": "750fcb27b23f1d9e1b0f9758d1dc8830655d5a35",
-      "file": "matting_xl_f32.onnx",
-      "sha256": "996cf2779c5b7c690b35ee1ef5e8890f8d2497e12dea97dc13ddd18e4132d04c"
+      "revision": "466029f998008e59601a3f611aec40fa55ef3f93",
+      "file": "matting_xl_temporal_f32.onnx",
+      "sha256": "67f79a367c4014d9df631afb002c99bf6efb1aa4ae122df175b45f2f92d611b6"
     }
   }
 }
