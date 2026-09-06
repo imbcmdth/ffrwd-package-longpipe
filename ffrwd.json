@@ -1,7 +1,7 @@
 {
   "name": "ffrwd/longpipe",
-  "version": "0.1.0",
-  "description": "Whole-frame foreground matting with longpipe's small net, hosted in wasm: one grayscale alpha matte per frame, and recipes that blur the background, replace it, or carry the picture with its alpha. Everything downstream is native ffmpeg. The model is sb2702/longpipe's work (MIT, code and weights), converted to ONNX and fetched at install.",
+  "version": "0.1.1",
+  "description": "Lightning fast, whole-frame foreground matting with longpipe's small net.",
   "license": "MIT",
   "homepage": "https://github.com/imbcmdth/ffrwd-package-longpipe",
   "capabilities": [
