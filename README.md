@@ -1,8 +1,7 @@
-<!-- DRAFT: maintainer rewrites package prose -->
 # ffrwd/longpipe
 
-Whole-frame foreground matting, hosted in wasm. `matte` turns each
-frame into one grayscale alpha - white where the subject is, black
+Lightninght fast, whole-frame foreground matting, hosted in wasm.
+`matte` turns each frame into one grayscale alpha - white where the subject is, black
 where the background is, blended at the edges - and everything
 downstream is native ffmpeg.
 
@@ -13,10 +12,7 @@ This package follows the weights' license.
 
 The weights are not in the archive: the manifest pins them - exact
 repo, revision, file and sha256 - and `ffrwd install` fetches and
-verifies them. The net runs at a fixed 192x112 through `wasi:nn` on
-the machine's own ONNX Runtime; the module stretches each frame in
-and brings the alpha back out to the frame's own size, so callers
-never see the model geometry.
+verifies them.
 
 ## Model export
 
@@ -40,7 +36,7 @@ carrying the matte as its own alpha channel, for compositing in an
 editor.
 
 ```
-ffrwd ffrwd.longpipe.background-blur -v source=call.mp4 -v dest=blurred.mp4
+ffrwd run ffrwd/longpipe:background-blur -v source=call.mp4 -v dest=blurred.mp4
 ```
 
 ## Building
