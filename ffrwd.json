@@ -1,6 +1,6 @@
 {
   "name": "ffrwd/longpipe",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Lightning fast, whole-frame foreground matting with longpipe's small net.",
   "license": "MIT",
   "homepage": "https://github.com/imbcmdth/ffrwd-package-longpipe",
@@ -9,7 +9,7 @@
   ],
   "dependencies": {
     "ffrwd/wasm": "0.12.0",
-    "ffrwd/mask_tools": "1.0.3"
+    "ffrwd/mask_tools": "1.1.1"
   },
   "keywords": [
     "matting",
