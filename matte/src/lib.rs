@@ -1,50 +1,41 @@
-//! Whole-frame matting: every frame leaves as a grayscale alpha of its
-//! foreground - 255 where the subject owns the pixel, 0 where the background
-//! does, and the values between are the blend.
+//! Whole-frame matting: every frame leaves as a gray alpha of its foreground,
+//! 255 where the subject owns the pixel, 0 where the background does, and the
+//! values between are the blend.
 //!
 //! The graph is longpipe's fused temporal xl export, run through `wasi:nn`
 //! at its fixed 1280x768 canvas. One compute takes the frame beside the
-//! previous frame's state - that frame at the flow half's base resolution,
-//! its four encoder taps, and the stabilizer carrier - and answers the
-//! stabilized alpha along with that state refreshed. The module holds the
-//! state between calls and feeds it back, so each matte is steadied against
-//! the frame before it. A call therefore depends on more than it was
-//! handed, and the module says so: it is impure, hosted one call at a time,
-//! in order.
+//! previous frame's state (that frame at the flow half's base resolution,
+//! its four encoder taps, and the stabilizer carrier) and answers the
+//! stabilized alpha along with that state refreshed. The node holds the
+//! state between ticks and feeds it back, so each matte is steadied against
+//! the frame before it. A tick therefore depends on more than it was handed,
+//! and the shape says so: the node is not pure, and runs as one instance, in
+//! order.
 //!
 //! The first frame of an instance has no previous frame. Its state is all
 //! zeros, its matte is the graph's raw alpha, and that alpha seeds the
-//! carrier beside a zero envelope - the cold start the export was built
-//! around. A new stream opens a new instance, so a discontinuity starts
-//! fresh.
+//! carrier beside a zero envelope, the cold start the export was built
+//! around.
 //!
-//! The frame is stretch-resized to the canvas - no letterbox, no crop, each
-//! axis by its own ratio - as RGB rescaled to 0..1 with no further
-//! normalization, and the alpha that comes back is resized bilinearly onto
-//! the frame's own geometry. The module never opens a file - the host binds
-//! the graph to a name with `-nn matte=<path>` and this module asks for that
-//! name and nothing else.
-//!
-//! The matte keeps the frame's geometry and pixel format, so it feeds
-//! straight into whatever reads a mask beside the picture: in yuv420p the
-//! alpha is the luma with neutral chroma, in rgba the same value in red,
-//! green and blue, opaque.
+//! Frames arrive as rgba, or as yuv420p converted here by ffrwd-frame in the
+//! range and matrix the stream declares. Each is stretch-resized to the
+//! canvas (no letterbox, no crop, each axis by its own ratio) as RGB rescaled
+//! to 0..1 with no further normalization, and the alpha that comes back is
+//! resized bilinearly onto the frame's own geometry as one byte a pixel. The
+//! module never opens a file: the host binds the graph to a name with
+//! `-nn matte=<path>` and this module asks for that name and nothing else.
 
-// `generate_all`: the world's interfaces come from two other packages -
-// ffrwd:av and wasi:nn - and without it bindgen expects them to have been
-// generated somewhere else.
+// `generate_all`: the world's interfaces are wasi:nn's, a package of its own,
+// and without it bindgen expects them to have been generated somewhere else.
 wit_bindgen::generate!({
-    path: ["wit", "wit-world"],
-    // Fully qualified: three packages are in scope, and each has worlds.
+    path: "wit-world",
     world: "ffrwd:longpipe/matte",
     generate_all,
 });
 
-use std::cell::RefCell;
-
-use exports::ffrwd::av::window_filter::{
-    Format, FramePayload, Guest, InWindow, Meta, OutFrame, Processed, StreamInfo, WindowMeta,
-};
+use ffrwd_frame::yuv::{self, Colour, Yuv420p};
+use ffrwd_frame::Rgba;
+use ffrwd_node::{Bound, Init, Input, NoParams, Node, Out, Output, Result, Shape, Tick};
 use wasi::nn::graph::{load_by_name, Graph};
 use wasi::nn::inference::GraphExecutionContext;
 use wasi::nn::tensor::{Tensor, TensorType};
@@ -62,7 +53,7 @@ const FRAME_IN: &str = "frame";
 
 /// The cross-frame inputs, in the export's order: the previous frame at the
 /// flow half's base resolution, its four encoder taps, and the stabilizer
-/// carrier - alpha beside envelope.
+/// carrier, alpha beside envelope.
 const STATE_IN: [&str; 6] = [
     "prev_frame_base",
     "prev_tap0",
@@ -102,29 +93,15 @@ const ALPHA_RAW: &str = "alpha_raw";
 /// The refreshed carrier a warm frame reads back.
 const STAB_STATE: &str = "stab_state";
 
-const PARAMS_SCHEMA: &str = r#"{"type":"object","properties":{},"additionalProperties":false}"#;
-
 /// A shape's length as the little-endian fp32 bytes it travels in.
 fn bytes_of(dims: &[u32]) -> usize {
     dims.iter().map(|d| *d as usize).product::<usize>() * 4
 }
 
-/// The pixel format an instance was opened for, fixed for its life.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PixFmt {
-    Yuv420p,
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Arrives {
     Rgba,
-}
-
-impl PixFmt {
-    /// The format the host named, or an error naming what it was.
-    fn parse(named: &str) -> Result<PixFmt, String> {
-        match named {
-            "yuv420p" => Ok(PixFmt::Yuv420p),
-            "rgba" => Ok(PixFmt::Rgba),
-            other => Err(format!("matte does not accept pixel format {other}")),
-        }
-    }
+    Yuv420p(Colour),
 }
 
 /// The tensors carried from one frame to the next, as the bytes they travel
@@ -136,7 +113,7 @@ struct State {
 }
 
 impl State {
-    /// Every tensor zero - an fp32 zero is four zero bytes.
+    /// Every tensor zero: an fp32 zero is four zero bytes.
     fn cold() -> State {
         State {
             tensors: STATE_DIMS.map(|dims| vec![0u8; bytes_of(&dims)]),
@@ -145,31 +122,19 @@ impl State {
     }
 }
 
-/// What `init` settled, plus the graph it loaded and the state the stream
-/// has reached.
-struct Opened {
+struct Matte {
+    v: u32,
     width: usize,
     height: usize,
-    pix_fmt: PixFmt,
-    /// Carried across `process` calls and fed back into every compute.
+    arrives: Arrives,
+    rgba: Vec<u8>,
+    /// Carried across ticks and fed back into every compute.
     state: State,
     /// Held for the life of the instance: building it once is what keeps a
     /// provider's kernels from being chosen again per frame.
     context: GraphExecutionContext,
     /// Kept alive because the context is only valid while its graph is.
     _graph: Graph,
-}
-
-thread_local! {
-    static OPENED: RefCell<Option<Opened>> = const { RefCell::new(None) };
-}
-
-/// This module takes no parameters: the net has no classes and no threshold.
-fn validate_params(params: &str) -> Result<(), String> {
-    match params.trim() {
-        "" | "{}" => Ok(()),
-        other => Err(format!("matte takes no params, got: {other}")),
-    }
 }
 
 /// The spec's spelling of an error code, so a message says what actually
@@ -188,6 +153,31 @@ fn failed(what: &str, error: &wasi::nn::errors::Error) -> String {
         ErrorCode::Unknown => "unknown",
     };
     format!("matte: {what}: {code} ({})", error.data())
+}
+
+fn colour(color: Option<&ffrwd_node::ColorInfo>) -> Result<Colour, String> {
+    Colour::of(color.map(|color| yuv::ColorInfo {
+        range: &color.range,
+        primaries: &color.primaries,
+        trc: &color.trc,
+        space: &color.space,
+    }))
+}
+
+fn as_rgba<'a>(
+    arrives: Arrives,
+    bytes: &'a [u8],
+    scratch: &'a mut [u8],
+    width: usize,
+    height: usize,
+) -> Result<Rgba<'a>, String> {
+    match arrives {
+        Arrives::Rgba => Rgba::new(bytes, width, height),
+        Arrives::Yuv420p(colour) => {
+            yuv::to_rgba(&Yuv420p::new(bytes, width, height)?, colour, scratch)?;
+            Rgba::new(scratch, width, height)
+        }
+    }
 }
 
 /// Where each of `count` output steps reads from along a source `extent`
@@ -221,40 +211,19 @@ impl Taps {
 
 /// One frame row as red, green and blue, a channel at a time so each is
 /// contiguous.
-fn row_to_rgb(frame: &[u8], pix_fmt: PixFmt, width: usize, height: usize, y: usize, out: &mut [f32]) {
+fn row_to_rgb(frame: &Rgba, y: usize, out: &mut [f32]) {
+    let width = frame.width;
     let (red, rest) = out.split_at_mut(width);
     let (green, blue) = rest.split_at_mut(width);
-    match pix_fmt {
-        PixFmt::Rgba => {
-            for (x, pixel) in frame[y * width * 4..(y + 1) * width * 4]
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .enumerate()
-            {
-                red[x] = f32::from(pixel[0]);
-                green[x] = f32::from(pixel[1]);
-                blue[x] = f32::from(pixel[2]);
-            }
-        }
-        PixFmt::Yuv420p => {
-            let pixels = width * height;
-            let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
-            let chroma = cw * ch;
-            let luma = &frame[y * width..(y + 1) * width];
-            let crow = (y / 2).min(ch - 1) * cw;
-            for x in 0..width {
-                let l = f32::from(luma[x]);
-                let ci = crow + (x / 2).min(cw - 1);
-                let u = f32::from(frame[pixels + ci]) - 128.0;
-                let v = f32::from(frame[pixels + chroma + ci]) - 128.0;
-                // The usual BT.601 inverse, in full range: the frames a module
-                // is handed are what the host decoded, not studio-swing video.
-                red[x] = l + 1.402 * v;
-                green[x] = l - 0.344_136 * u - 0.714_136 * v;
-                blue[x] = l + 1.772 * u;
-            }
-        }
+    for (x, pixel) in frame.data[y * width * 4..(y + 1) * width * 4]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .enumerate()
+    {
+        red[x] = f32::from(pixel[0]);
+        green[x] = f32::from(pixel[1]);
+        blue[x] = f32::from(pixel[2]);
     }
 }
 
@@ -275,11 +244,12 @@ fn resize_rgb_row(rgb: &[f32], columns: &Taps, width: usize, out: &mut [f32]) {
     }
 }
 
-/// The frame stretched to the 1280x768 canvas - each axis by its own ratio,
-/// no letterbox, the contract the weights shipped with - and laid out as the
+/// The frame stretched to the 1280x768 canvas (each axis by its own ratio, no
+/// letterbox, the contract the weights shipped with) and laid out as the
 /// planar fp32 tensor the graph expects: red, green and blue in turn, each
 /// rescaled to 0..1 and nothing else.
-fn to_input(frame: &[u8], pix_fmt: PixFmt, width: usize, height: usize) -> Vec<u8> {
+fn to_input(frame: &Rgba) -> Vec<u8> {
+    let (width, height) = (frame.width, frame.height);
     let plane = CANVAS_W * CANVAS_H;
     let mut planes = vec![0f32; plane * 3];
 
@@ -290,10 +260,10 @@ fn to_input(frame: &[u8], pix_fmt: PixFmt, width: usize, height: usize) -> Vec<u
     let mut bottom = vec![0f32; CANVAS_W * 3];
 
     for my in 0..CANVAS_H {
-        row_to_rgb(frame, pix_fmt, width, height, rows.low[my], &mut rgb);
+        row_to_rgb(frame, rows.low[my], &mut rgb);
         resize_rgb_row(&rgb, &columns, width, &mut top);
         if rows.high[my] != rows.low[my] {
-            row_to_rgb(frame, pix_fmt, width, height, rows.high[my], &mut rgb);
+            row_to_rgb(frame, rows.high[my], &mut rgb);
             resize_rgb_row(&rgb, &columns, width, &mut bottom);
         } else {
             bottom.copy_from_slice(&top);
@@ -368,7 +338,7 @@ fn advance(state: &mut State, mut outputs: Vec<(String, Vec<u8>)>) -> Result<Vec
 }
 
 /// The graph's alpha brought onto the frame's own geometry, bilinearly, as
-/// 8-bit gray.
+/// one byte a pixel.
 fn upscale_alpha(alpha: &[f32], width: usize, height: usize) -> Vec<u8> {
     let columns = Taps::build(width, CANVAS_W);
     let rows = Taps::build(height, CANVAS_H);
@@ -389,92 +359,62 @@ fn upscale_alpha(alpha: &[f32], width: usize, height: usize) -> Vec<u8> {
     map
 }
 
-/// A matte written as a frame of the instance's own format: the luma plane
-/// with neutral chroma, or the same value in red, green and blue.
-fn to_frame(map: &[u8], pix_fmt: PixFmt, width: usize, height: usize, len: usize) -> Vec<u8> {
-    let mut out = vec![0u8; len];
-    match pix_fmt {
-        PixFmt::Yuv420p => {
-            out[..width * height].copy_from_slice(map);
-            // 128 in both chroma planes is no colour at all.
-            out[width * height..].fill(128);
+impl Matte {
+    /// One frame through the graph: the frame stretched to canvas beside the
+    /// carried state, the state refreshed from the answer, the alpha brought
+    /// onto the frame's own geometry.
+    fn run(&mut self, frame: &[u8]) -> Result<Vec<u8>, String> {
+        let picture = as_rgba(self.arrives, frame, &mut self.rgba, self.width, self.height)?;
+        let input = to_input(&picture);
+        let mut feeds = Vec::with_capacity(1 + STATE_IN.len());
+        let frame_dims = [1, 3, CANVAS_H as u32, CANVAS_W as u32];
+        feeds.push((
+            FRAME_IN.to_string(),
+            Tensor::new(&frame_dims, TensorType::Fp32, &input),
+        ));
+        for ((name, dims), bytes) in STATE_IN.iter().zip(&STATE_DIMS).zip(&self.state.tensors) {
+            feeds.push((name.to_string(), Tensor::new(dims, TensorType::Fp32, bytes)));
         }
-        PixFmt::Rgba => {
-            for (pixel, value) in out.as_chunks_mut::<4>().0.iter_mut().zip(map) {
-                *pixel = [*value, *value, *value, 255];
-            }
-        }
+        let returned = self
+            .context
+            .compute(feeds)
+            .map_err(|e| failed("compute", &e))?;
+        let outputs: Vec<(String, Vec<u8>)> = returned
+            .into_iter()
+            .map(|(name, tensor)| (name, tensor.data()))
+            .collect();
+        let alpha = advance(&mut self.state, outputs)?;
+        Ok(upscale_alpha(&le_f32s(&alpha), self.width, self.height))
     }
-    out
 }
 
-/// One frame through the graph: the frame stretched to canvas beside the
-/// carried state, the state refreshed from the answer, the alpha brought
-/// onto the frame's own geometry.
-fn run(opened: &mut Opened, frame: &[u8], len: usize) -> Result<Vec<u8>, String> {
-    let input = to_input(frame, opened.pix_fmt, opened.width, opened.height);
-    let mut feeds = Vec::with_capacity(1 + STATE_IN.len());
-    let frame_dims = [1, 3, CANVAS_H as u32, CANVAS_W as u32];
-    feeds.push((
-        FRAME_IN.to_string(),
-        Tensor::new(&frame_dims, TensorType::Fp32, &input),
-    ));
-    for ((name, dims), bytes) in STATE_IN.iter().zip(&STATE_DIMS).zip(&opened.state.tensors) {
-        feeds.push((name.to_string(), Tensor::new(dims, TensorType::Fp32, bytes)));
-    }
-    let returned = opened
-        .context
-        .compute(feeds)
-        .map_err(|e| failed("compute", &e))?;
-    let outputs: Vec<(String, Vec<u8>)> = returned
-        .into_iter()
-        .map(|(name, tensor)| (name, tensor.data()))
-        .collect();
-    let alpha = advance(&mut opened.state, outputs)?;
-    let map = upscale_alpha(&le_f32s(&alpha), opened.width, opened.height);
-    Ok(to_frame(
-        &map,
-        opened.pix_fmt,
-        opened.width,
-        opened.height,
-        len,
-    ))
-}
+impl Node for Matte {
+    const NAME: &'static str = "matte";
+    const VERSION: &'static str = "0.2.0";
+    type Params = NoParams;
 
-struct Matte;
-
-impl Guest for Matte {
-    fn describe() -> WindowMeta {
-        WindowMeta {
-            meta: Meta {
-                name: "matte".to_string(),
-                version: "0.1.0".to_string(),
-                params_schema: PARAMS_SCHEMA.to_string(),
-                rows_schema: String::new(),
-                pixel_formats: vec!["yuv420p".to_string(), "rgba".to_string()],
-                sample_formats: vec![],
-                sample_rates: vec![],
-                channel_counts: vec![],
-                rows_language: vec![],
-            },
-            window: 1,
-            stride: 1,
-            // Each call reads the state the one before it left, so calls
-            // happen one at a time, in order.
-            pure: false,
-            one_to_one: true,
-            reads_rows: false,
-            forwards_rows: false,
-            inputs: 1,
-        }
+    fn shape(_: &NoParams, _: &Bound) -> Result<Shape> {
+        Ok(Shape::new()
+            .input(
+                Input::video("v")
+                    .clock()
+                    .pixel_formats(&["yuv420p", "rgba"]),
+            )
+            .output(Output::like("v").pixel_format("gray"))
+            .one_to_one())
     }
 
-    fn init(format: Format, _stream_info: StreamInfo, params: String) -> Result<(), String> {
-        let Format::Video(video) = format else {
-            return Err("matte reads frames, and this stream is audio".to_string());
+    fn init(_: NoParams, init: &Init) -> Result<Matte> {
+        let v = init.stream("v")?;
+        let video = v
+            .video_format()
+            .ok_or("matte reads frames, and `v` is not video")?;
+        let (width, height) = (video.width as usize, video.height as usize);
+        let arrives = match video.pix_fmt.as_str() {
+            "rgba" => Arrives::Rgba,
+            "yuv420p" => Arrives::Yuv420p(colour(video.color.as_ref())?),
+            other => return Err(format!("matte does not accept pixel format {other}").into()),
         };
-        let pix_fmt = PixFmt::parse(&video.pix_fmt)?;
-        validate_params(&params)?;
 
         // The graph is loaded once per instance, and the session built once:
         // the first frame is what a provider picks its kernels on, and every
@@ -485,59 +425,107 @@ impl Guest for Matte {
             .init_execution_context()
             .map_err(|e| failed("init-execution-context", &e))?;
 
-        OPENED.with(|o| {
-            *o.borrow_mut() = Some(Opened {
-                width: video.width as usize,
-                height: video.height as usize,
-                pix_fmt,
-                state: State::cold(),
-                context,
-                _graph: graph,
-            });
-        });
-        Ok(())
+        Ok(Matte {
+            v: v.id,
+            width,
+            height,
+            arrives,
+            rgba: match arrives {
+                Arrives::Rgba => Vec::new(),
+                Arrives::Yuv420p(_) => vec![0; width * height * 4],
+            },
+            state: State::cold(),
+            context,
+            _graph: graph,
+        })
     }
 
-    fn set_params(params: String) -> Result<(), String> {
-        validate_params(&params)
-    }
-
-    fn process(window: &InWindow, _trailing: Vec<String>, _last: bool) -> Processed {
-        // The final call carries nothing: window and stride are 1, so no
-        // frame is ever left over.
-        let mut out = Vec::with_capacity(window.len() as usize);
-        OPENED.with(|opened| {
-            let mut borrowed = opened.borrow_mut();
-            let opened = borrowed
-                .as_mut()
-                .expect("init loads the graph before any frame arrives");
-            for i in 0..window.len() {
-                let frame = window.fetch(i);
-                match run(opened, &frame, frame.len()) {
-                    Ok(map) => out.push(OutFrame {
-                        pts: window.pts(i),
-                        frame: FramePayload::New(map),
-                        rows: vec![],
-                    }),
-                    // `process` has no way to say no, so a graph that failed
-                    // mid-stream stops the run rather than passing a frame
-                    // off as a matte.
-                    Err(message) => panic!("{message}"),
-                }
-            }
-        });
-        Processed {
-            frames: out,
-            trailing: vec![],
+    fn process(&mut self, tick: &Tick, out: &mut Out) -> Result<()> {
+        for frame in tick.frames(self.v) {
+            let bytes = tick.fetch(self.v, frame.index);
+            let map = self.run(&bytes)?;
+            out.frame("v", frame.pts, frame.duration, map)?;
         }
+        Ok(())
     }
 }
 
-export!(Matte);
+ffrwd_node::export!(Matte);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ffrwd_node::{Format, Runner};
+
+    fn color(range: &str, space: &str) -> ffrwd_node::ColorInfo {
+        ffrwd_node::ColorInfo {
+            range: range.to_owned(),
+            primaries: "unknown".to_owned(),
+            trc: "unknown".to_owned(),
+            space: space.to_owned(),
+        }
+    }
+
+    fn flat_yuv(width: usize, height: usize, luma: u8) -> Vec<u8> {
+        let mut frame = vec![128u8; Yuv420p::size(width, height)];
+        frame[..width * height].fill(luma);
+        frame
+    }
+
+    #[test]
+    fn the_matte_is_the_picture_in_gray_one_instance_in_order() {
+        let shape = Runner::<Matte>::shape("", &["v".to_owned()]).expect("a shape");
+        assert_eq!(shape.clock_input(), Some("v"));
+        assert_eq!(shape.inputs[0].accepts.pixel_formats, ["yuv420p", "rgba"]);
+        assert_eq!(shape.outputs.len(), 1);
+        let map = &shape.outputs[0];
+        assert_eq!(map.name, "v");
+        assert_eq!(map.format, None::<Format>);
+        let like = map.like.as_ref().expect("follows its input");
+        assert_eq!(
+            (like.port.as_deref(), like.pixel_format.as_deref()),
+            (Some("v"), Some("gray"))
+        );
+        assert!(
+            !shape.pure,
+            "each tick reads the state the one before it left"
+        );
+        assert!(shape.one_to_one);
+    }
+
+    #[test]
+    fn params_are_refused_because_there_are_none() {
+        assert!(Runner::<Matte>::shape("{}", &["v".to_owned()]).is_ok());
+        let error = Runner::<Matte>::shape(r#"{"conf":0.5}"#, &["v".to_owned()])
+            .expect_err("no params exist");
+        assert!(error.contains("conf"), "{error}");
+    }
+
+    #[test]
+    fn a_tv_range_picture_reaches_the_net_at_full_contrast() {
+        let tv = Arrives::Yuv420p(colour(Some(&color("tv", "bt709"))).expect("tv 709"));
+        for (luma, grey) in [(16u8, 0u8), (235, 255)] {
+            let bytes = flat_yuv(4, 2, luma);
+            let mut scratch = vec![0u8; 4 * 2 * 4];
+            let picture = as_rgba(tv, &bytes, &mut scratch, 4, 2).expect("converts");
+            assert!(
+                picture
+                    .data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|p| *p == [grey, grey, grey, 255]),
+                "luma {luma} is grey {grey}: {:?}",
+                &picture.data[..4]
+            );
+        }
+    }
+
+    #[test]
+    fn a_matrix_ffrwd_frame_does_not_convert_is_refused_at_init() {
+        let err = colour(Some(&color("tv", "ycgco"))).expect_err("not converted here");
+        assert!(err.contains("rgba"), "{err}");
+    }
 
     #[test]
     fn an_identity_resize_reads_each_sample_squarely() {
@@ -561,7 +549,7 @@ mod tests {
     fn the_input_is_the_canvas_plane_count_and_size() {
         let (width, height) = (8usize, 8usize);
         let frame = vec![0u8; width * height * 4];
-        let bytes = to_input(&frame, PixFmt::Rgba, width, height);
+        let bytes = to_input(&Rgba::new(&frame, width, height).expect("8x8"));
         assert_eq!(bytes.len(), 3 * CANVAS_H * CANVAS_W * 4);
     }
 
@@ -570,11 +558,10 @@ mod tests {
         // Every pixel 51 in every channel: the stretch cannot invent detail,
         // and 51/255 is exactly 0.2.
         let (width, height) = (16usize, 16usize);
-        let frame: Vec<u8> = std::iter::repeat([51, 51, 51, 255])
-            .take(width * height)
+        let frame: Vec<u8> = std::iter::repeat_n([51, 51, 51, 255], width * height)
             .flatten()
             .collect();
-        let bytes = to_input(&frame, PixFmt::Rgba, width, height);
+        let bytes = to_input(&Rgba::new(&frame, width, height).expect("16x16"));
         let (words, _) = bytes.as_chunks::<4>();
         for word in words {
             let value = f32::from_le_bytes(*word);
@@ -583,23 +570,10 @@ mod tests {
     }
 
     #[test]
-    fn neutral_chroma_yuv_is_grayscale_rgb() {
-        let (width, height) = (4usize, 4usize);
-        let mut frame = vec![100u8; width * height];
-        frame.extend(vec![128u8; 2 * 2 * 2]);
-        let mut rgb = vec![0f32; width * 3];
-        row_to_rgb(&frame, PixFmt::Yuv420p, width, height, 0, &mut rgb);
-        for x in 0..width {
-            assert!((rgb[x] - 100.0).abs() < 0.01, "red is the luma");
-            assert!((rgb[width + x] - 100.0).abs() < 0.01);
-            assert!((rgb[2 * width + x] - 100.0).abs() < 0.01);
-        }
-    }
-
-    #[test]
     fn a_flat_alpha_upscales_flat_and_rounds_to_full() {
         let alpha = vec![1.0f32; CANVAS_W * CANVAS_H];
         let map = upscale_alpha(&alpha, 33, 17);
+        assert_eq!(map.len(), 33 * 17, "one byte a pixel");
         assert!(map.iter().all(|v| *v == 255));
         let none = vec![0.0f32; CANVAS_W * CANVAS_H];
         assert!(upscale_alpha(&none, 33, 17).iter().all(|v| *v == 0));
@@ -609,7 +583,7 @@ mod tests {
     fn an_alpha_edge_upscales_as_a_monotonic_ramp() {
         // Left half 0, right half 1: each output row must never step down.
         let mut alpha = vec![0.0f32; CANVAS_W * CANVAS_H];
-        for row in alpha.chunks_exact_mut(CANVAS_W) {
+        for row in alpha.as_chunks_mut::<CANVAS_W>().0 {
             for value in &mut row[CANVAS_W / 2..] {
                 *value = 1.0;
             }
@@ -620,27 +594,6 @@ mod tests {
         assert!(row.windows(2).all(|pair| pair[0] <= pair[1]));
         assert_eq!(row[0], 0);
         assert_eq!(row[width - 1], 255);
-    }
-
-    #[test]
-    fn a_matte_writes_neutral_chroma_and_opaque_alpha() {
-        let map = vec![255u8; 4 * 4];
-        let yuv = to_frame(&map, PixFmt::Yuv420p, 4, 4, 4 * 4 + 2 * 2 * 2);
-        assert!(yuv[..16].iter().all(|v| *v == 255), "the luma is the matte");
-        assert!(
-            yuv[16..].iter().all(|v| *v == 128),
-            "and the chroma is neutral"
-        );
-
-        let rgba = to_frame(&map, PixFmt::Rgba, 4, 4, 4 * 4 * 4);
-        let (pixels, _) = rgba.as_chunks::<4>();
-        for pixel in pixels {
-            assert_eq!(
-                *pixel,
-                [255, 255, 255, 255],
-                "equal in every channel, and opaque"
-            );
-        }
     }
 
     /// The full answer a compute returns, each tensor filled with its own
@@ -655,7 +608,10 @@ mod tests {
             (STAB_STATE.to_string(), vec![3u8; 2 * plane]),
         ];
         for (i, name) in STATE_OUT.iter().enumerate() {
-            outputs.push((name.to_string(), vec![10 + i as u8; bytes_of(&STATE_DIMS[i])]));
+            outputs.push((
+                name.to_string(),
+                vec![10 + i as u8; bytes_of(&STATE_DIMS[i])],
+            ));
         }
         outputs
     }
@@ -730,13 +686,5 @@ mod tests {
         outputs[at].1.truncate(16);
         let error = advance(&mut state, outputs).expect_err("truncated");
         assert!(error.contains("cur_frame_base"), "{error}");
-    }
-
-    #[test]
-    fn params_are_refused_because_there_are_none() {
-        assert!(validate_params("").is_ok());
-        assert!(validate_params("{}").is_ok());
-        let error = validate_params(r#"{"conf":0.5}"#).expect_err("no params exist");
-        assert!(error.contains("matte takes no params"), "{error}");
     }
 }

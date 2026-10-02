@@ -2,23 +2,15 @@
   "format_version": 3,
   "reproducible": true,
   "dependencies": {
-    "ffrwd/wasm": "0.12.0",
     "ffrwd/mask_tools": "1.1.1"
   },
   "packages": [
     {
       "kind": "registry",
       "name": "ffrwd/wasm",
-      "version": "0.12.0",
-      "sha256": "00a56f4c1aee559c9608d596a53fb429a0347ad6db62f6ce3e1f64615a2f5bd9",
-      "store": "v1/00/00a56f4c1aee559c9608d596a53fb429a0347ad6db62f6ce3e1f64615a2f5bd9"
-    },
-    {
-      "kind": "registry",
-      "name": "ffrwd/wasm",
-      "version": "0.15.0",
-      "sha256": "0942300729e217d46f5eb22504b920cfa8cf465e7e031307a636a1da7f9bc836",
-      "store": "v1/09/0942300729e217d46f5eb22504b920cfa8cf465e7e031307a636a1da7f9bc836"
+      "version": "0.18.0",
+      "sha256": "1be9b4ff42177adc4fef10cc7a9041e2d4d32e82d22a624907aa2289c66052c9",
+      "store": "v1/1b/1be9b4ff42177adc4fef10cc7a9041e2d4d32e82d22a624907aa2289c66052c9"
     },
     {
       "kind": "registry",
@@ -27,7 +19,7 @@
       "sha256": "d328202f3596b1ba9234cf634411f900358ecd6ad00de0d7734c04d510636480",
       "store": "v1/d3/d328202f3596b1ba9234cf634411f900358ecd6ad00de0d7734c04d510636480",
       "dependencies": {
-        "ffrwd/wasm": "0.15.0"
+        "ffrwd/wasm": "0.18.0"
       }
     }
   ]

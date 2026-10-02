@@ -5,4 +5,4 @@ COPY (
   SELECT ffrwd.longpipe.matte(v)
   FROM input(:'source') f, unnest(f.video) v
   WHERE v.index = COALESCE(:track, 1)
-) TO :'dest' WITH (video_codec 'libx264', crf 20)
+) TO :'dest' WITH (video_codec 'libx264', crf 20, pix_fmt 'yuv420p')
