@@ -5,7 +5,7 @@ Lightninght fast, whole-frame foreground matting, hosted in wasm.
 where the background is, blended at the edges - and everything
 downstream is native ffmpeg.
 
-Requires ffrwd 0.29.
+Requires ffrwd 0.29, whose `ffrwd/wasm` is 0.19.1.
 
 The model is [sb2702/longpipe](https://github.com/sb2702/longpipe)'s
 work: the small matting net, MIT-licensed code and weights, converted

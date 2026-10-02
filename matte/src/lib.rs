@@ -390,7 +390,7 @@ impl Matte {
 
 impl Node for Matte {
     const NAME: &'static str = "matte";
-    const VERSION: &'static str = "0.2.0";
+    const VERSION: &'static str = "0.2.1";
     type Params = NoParams;
 
     fn shape(_: &NoParams, _: &Bound) -> Result<Shape> {
