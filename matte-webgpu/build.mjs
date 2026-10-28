@@ -37,11 +37,13 @@ const componentize = COMPONENTIZE === '0.19' ? componentize0193 : componentize02
 const AOT = process.env.AOT === '1';
 // The shim submits a frame's commands as one batch unless `BATCH=0`.
 const BATCH = process.env.BATCH !== '0';
+// `v` taken as yuv420p first, made rgba by the module (`MATTE_YUV=1`).
+const YUV = process.env.MATTE_YUV === '1';
 
 const TIMING = Number(process.env.MATTE_TIMING ?? 0);
 const NAME =
   process.env.MATTE_NAME ??
-  ['matte', TIMING > 0 && 'timing', COMPONENTIZE === '0.22' && 'cjs022', AOT && 'aot', !BATCH && 'nobatch'].filter(Boolean).join('-');
+  ['matte', TIMING > 0 && 'timing', COMPONENTIZE === '0.22' && 'cjs022', AOT && 'aot', !BATCH && 'nobatch', YUV && 'yuv'].filter(Boolean).join('-');
 
 // As jsqr's build: StarlingMonkey imports wasi:http for `fetch` unless it
 // is off. Clocks stay: longpipe's renderer reads `performance.now()`.
@@ -75,7 +77,7 @@ async function bundle() {
     mainFields: ['module', 'main'],
     loader: { '.wgsl': 'text' },
     external: ['wasi:*', 'ffrwd:*'],
-    define: { 'globalThis.MATTE_TIMING': String(TIMING), 'globalThis.WEBGPU_SHIM_BATCH': String(BATCH) },
+    define: { 'globalThis.MATTE_TIMING': String(TIMING), 'globalThis.WEBGPU_SHIM_BATCH': String(BATCH), 'globalThis.MATTE_YUV': String(YUV) },
     plugins: [upstream],
     legalComments: 'inline',
     metafile: true,

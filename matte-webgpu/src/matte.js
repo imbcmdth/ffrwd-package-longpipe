@@ -46,6 +46,12 @@ const PRESET = {
 const TIMING_EVERY = Number(globalThis.MATTE_TIMING ?? 0);
 if (TIMING_EVERY > 0) profile();
 
+// The formats `v` is taken in, preferred first. rgba first, as every
+// module that feeds a model lists it: the sidecar makes a decoder's nv12
+// rgba on the device. A build with `MATTE_YUV=1` lists yuv420p first, and
+// this module's own pass makes it rgba.
+const PIXEL_FORMATS = globalThis.MATTE_YUV ? ['yuv420p', 'rgba'] : ['rgba', 'yuv420p'];
+
 const MATTE_WGSL = /* wgsl */ `
 // The renderer's alpha, one vec4 a pixel at the frame's size with the alpha
 // in .r, written as rgba8unorm with the alpha in every channel.
@@ -290,7 +296,7 @@ function frame(state, f) {
 export const { node, ports } = gpuNode({
   name: 'matte',
   version: VERSION,
-  pixelFormats: ['rgba', 'yuv420p'],
+  pixelFormats: PIXEL_FORMATS,
   // The stabilizer carries the previous frame's matte into this one.
   pure: false,
   open,
