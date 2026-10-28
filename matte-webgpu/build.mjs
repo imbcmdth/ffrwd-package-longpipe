@@ -8,7 +8,8 @@
 //   LONGPIPE_WEIGHTS=<path>     the small tier's weight file (default: the
 //                               spike's copy), checked against its sha256
 
-import { componentize } from '@bytecodealliance/componentize-js';
+import { componentize as componentize022 } from '@bytecodealliance/componentize-js';
+import { componentize as componentize0193 } from '@bytecodealliance/componentize-js-0-19-3';
 import { build } from 'esbuild';
 import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -25,8 +26,22 @@ const UPSTREAM = join(here, 'longpipe', 'src');
 const WEIGHTS = process.env.LONGPIPE_WEIGHTS ?? 'E:/projects/longpipe-spike/model_small.bin';
 const WEIGHTS_SHA256 = '56430de7da6cfd6b834753f912441fbca00ad397790e308b8dc041e5c0b03394';
 
+// Which ComponentizeJS makes the component: 0.19.3 (the default) or 0.22.0
+// (`COMPONENTIZE=0.22`). 0.22's bindings make a task record on every import
+// call (an AsyncTask, its id and bookkeeping, built in the interpreter),
+// about 35 us a call against 0.19.3's 1 to 2; longpipe makes hundreds of
+// calls a frame, so 0.22 costs 29 ms a frame where 0.19.3 costs 6.
+const COMPONENTIZE = process.env.COMPONENTIZE ?? '0.19';
+const componentize = COMPONENTIZE === '0.19' ? componentize0193 : componentize022;
+// weval's ahead-of-time compile of the JavaScript (`AOT=1`).
+const AOT = process.env.AOT === '1';
+// The shim submits a frame's commands as one batch unless `BATCH=0`.
+const BATCH = process.env.BATCH !== '0';
+
 const TIMING = Number(process.env.MATTE_TIMING ?? 0);
-const NAME = process.env.MATTE_NAME ?? (TIMING > 0 ? 'matte-timing' : 'matte');
+const NAME =
+  process.env.MATTE_NAME ??
+  ['matte', TIMING > 0 && 'timing', COMPONENTIZE === '0.22' && 'cjs022', AOT && 'aot', !BATCH && 'nobatch'].filter(Boolean).join('-');
 
 // As jsqr's build: StarlingMonkey imports wasi:http for `fetch` unless it
 // is off. Clocks stay: longpipe's renderer reads `performance.now()`.
@@ -60,7 +75,7 @@ async function bundle() {
     mainFields: ['module', 'main'],
     loader: { '.wgsl': 'text' },
     external: ['wasi:*', 'ffrwd:*'],
-    define: { 'globalThis.MATTE_TIMING': String(TIMING) },
+    define: { 'globalThis.MATTE_TIMING': String(TIMING), 'globalThis.WEBGPU_SHIM_BATCH': String(BATCH) },
     plugins: [upstream],
     legalComments: 'inline',
     metafile: true,
@@ -80,6 +95,7 @@ const { component } = await componentize({
   witPath: join(here, 'wit'),
   worldName: 'ffrwd:longpipe-webgpu/matte',
   disableFeatures: DISABLED,
+  enableAot: AOT,
 });
 const wasm = join(OUT, `${NAME}.wasm`);
 writeFileSync(wasm, component);

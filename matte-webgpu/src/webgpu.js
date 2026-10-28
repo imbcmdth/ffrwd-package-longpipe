@@ -424,6 +424,7 @@ export class GPUDevice extends Wrapper {
     this.limits = limits(handle.limits());
     this.adapterInfo = adapterInfo(handle.adapterInfo());
     this.#queue = new GPUQueue(handle.queue(), this);
+    theQueue = this.#queue;
     // `lost` never settles: the device is the sidecar's and outlives the
     // module.
     this.lost = new Promise(() => {});
@@ -562,7 +563,7 @@ export class GPUDevice extends Wrapper {
   }
 
   createCommandEncoder(d = {}) {
-    return new GPUCommandEncoder(host(this).createCommandEncoder({ label: d.label }), d.label);
+    return new GPUCommandEncoder(d.label);
   }
 
   pushErrorScope(filter) {
@@ -601,6 +602,7 @@ export class GPUBuffer extends Wrapper {
   }
 
   async mapAsync(mode, offset, size) {
+    flushQueue();
     host(this).mapAsync(mode, u64(offset), u64(size));
     this.#mode = mode;
     this.mapState = 'mapped';
@@ -631,6 +633,7 @@ export class GPUBuffer extends Wrapper {
   }
 
   destroy() {
+    flushQueue();
     host(this).destroy();
   }
 }
@@ -690,6 +693,7 @@ export class GPUTexture extends Wrapper {
   }
 
   destroy() {
+    flushQueue();
     host(this).destroy();
   }
 }
@@ -699,7 +703,6 @@ export class GPUSampler extends Wrapper {}
 export class GPUBindGroupLayout extends Wrapper {}
 export class GPUBindGroup extends Wrapper {}
 export class GPUPipelineLayout extends Wrapper {}
-export class GPUCommandBuffer extends Wrapper {}
 
 export class GPUShaderModule extends Wrapper {
   async getCompilationInfo() {
@@ -732,8 +735,23 @@ class Pipeline extends Wrapper {
 export class GPUComputePipeline extends Pipeline {}
 export class GPURenderPipeline extends Pipeline {}
 
+// Command encoders record, and the queue submits what they recorded in one
+// host encoder at the next point that has to see it done: `flush()`, a
+// write, a map, `onSubmittedWorkDone`, or a destroy. longpipe encodes and
+// submits each op of its network on its own, some ninety a frame, and on
+// the sidecar a host call costs microseconds where a browser's costs
+// nothing, so the commands of a frame go to the host as one command buffer,
+// its adjacent compute passes as one pass. The order of the queue is
+// unchanged: everything submitted before a write is on the device before
+// the write is, as WebGPU orders them. A validation error is reported when
+// the batch is encoded, not at the call that caused it. `BATCH` false
+// submits each command buffer as it comes, for comparison.
+const BATCH = globalThis.WEBGPU_SHIM_BATCH ?? true;
+
 export class GPUQueue extends Wrapper {
   #device;
+  #pending = [];
+  #waiting = [];
 
   constructor(handle, device) {
     super(handle);
@@ -741,18 +759,76 @@ export class GPUQueue extends Wrapper {
   }
 
   submit(buffers) {
-    host(this).submit(buffers.map(host));
+    for (const buffer of buffers) {
+      if (!(buffer instanceof GPUCommandBuffer)) throw new TypeError(`webgpu shim: submit takes command buffers, not ${describe(buffer)}`);
+      if (buffer.ops === null) throw new Error('webgpu shim: a command buffer is submitted once');
+      this.#pending.push(...buffer.ops);
+      buffer.ops = null;
+    }
+    if (!BATCH) this.flush();
   }
 
-  async onSubmittedWorkDone() {
+  /** Encodes and submits what has been submitted since the last flush. */
+  flush() {
+    if (this.#waiting.length > 0) {
+      host(this).onSubmittedWorkDone();
+      this.#settle();
+    }
+    if (this.#pending.length === 0) return;
+    const ops = this.#pending;
+    this.#pending = [];
+    const encoder = host(this.#device).createCommandEncoder(undefined);
+    let pass = null;
+    let state = null;
+    for (const op of ops) {
+      if (op.kind === 'compute') {
+        if (pass === null) {
+          pass = encoder.beginComputePass(undefined);
+          state = { pipeline: null, groups: [] };
+        }
+        for (const command of op.commands) command(pass, state);
+        continue;
+      }
+      if (pass !== null) {
+        pass.end();
+        pass = null;
+      }
+      op.run(encoder);
+    }
+    if (pass !== null) pass.end();
+    host(this).submit([encoder.finish(undefined)]);
+  }
+
+  // `on-submitted-work-done` blocks until the queue drains, and longpipe's
+  // renderer asks for it on every fifth model run to time the model, so a
+  // blocking wait there would stall the queue every fifth frame. The promise
+  // is settled instead at the next flush, before that flush submits: the
+  // work it waits for is then done, or nearly, and the host's wait costs
+  // what is left of it. `drain()` waits at once.
+  onSubmittedWorkDone() {
+    return new Promise((resolve) => this.#waiting.push(resolve));
+  }
+
+  /** Submits what is pending and waits for the queue to drain. */
+  drain() {
+    this.flush();
     host(this).onSubmittedWorkDone();
+    this.#settle();
+  }
+
+  #settle() {
+    const waiting = this.#waiting;
+    this.#waiting = [];
+    for (const resolve of waiting) resolve();
   }
 
   writeBuffer(buffer, bufferOffset, data, dataOffset, size) {
+    this.flush();
     host(this).writeBufferWithCopy(host(buffer), u64(bufferOffset), bytesOf(data, dataOffset, size), undefined, undefined);
   }
 
   writeTexture(destination, data, layout, size) {
+    this.flush();
     const e = extentSizes(size);
     host(this).writeTextureWithCopy(
       texelCopyTexture(destination),
@@ -772,153 +848,210 @@ export class GPUQueue extends Wrapper {
     if (source.flipY) unsupported('copyExternalImageToTexture with flipY');
     if (destination.premultipliedAlpha) unsupported('copyExternalImageToTexture with premultipliedAlpha');
     const encoder = this.#device.createCommandEncoder();
-    encoder.copyTextureToTexture(
-      { texture: image.texture, origin: source.origin },
-      destination,
-      copySize,
-    );
+    encoder.copyTextureToTexture({ texture: image.texture, origin: source.origin }, destination, copySize);
     this.submit([encoder.finish()]);
   }
 }
 
-export class GPUCommandEncoder extends Wrapper {
+/** The queue of the one device made here, flushed before a resource is
+ * destroyed or mapped. */
+let theQueue = null;
+const flushQueue = () => theQueue?.flush();
+
+export class GPUCommandBuffer {
+  constructor(ops, label) {
+    this.ops = ops;
+    this.label = label ?? '';
+  }
+}
+
+export class GPUCommandEncoder {
+  #ops = [];
+
+  constructor(label) {
+    this.label = label ?? '';
+  }
+
+  #record(run) {
+    this.#ops.push({ kind: 'copy', run });
+  }
+
   beginComputePass(d = {}) {
     if (d.timestampWrites) unsupported('compute pass timestampWrites');
-    return new GPUComputePassEncoder(host(this).beginComputePass({ timestampWrites: undefined, label: d.label }));
+    const op = { kind: 'compute', commands: [] };
+    this.#ops.push(op);
+    return new GPUComputePassEncoder(op.commands);
   }
 
   beginRenderPass(d) {
     if (d.timestampWrites) unsupported('render pass timestampWrites');
     if (d.occlusionQuerySet) unsupported('render pass occlusionQuerySet');
     const ds = d.depthStencilAttachment;
-    return new GPURenderPassEncoder(
-      host(this).beginRenderPass({
-        colorAttachments: d.colorAttachments.map((a) =>
-          a === null || a === undefined
-            ? undefined
-            : {
-                view: host(a.view instanceof GPUTexture ? a.view.createView() : a.view),
-                depthSlice: a.depthSlice,
-                resolveTarget: a.resolveTarget ? host(a.resolveTarget) : undefined,
-                clearValue: color(a.clearValue),
-                loadOp: a.loadOp,
-                storeOp: a.storeOp,
-              },
-        ),
-        depthStencilAttachment: ds && { ...ds, view: host(ds.view) },
-        occlusionQuerySet: undefined,
-        timestampWrites: undefined,
-        maxDrawCount: u64(d.maxDrawCount),
-        label: d.label,
-      }),
-    );
+    const descriptor = {
+      colorAttachments: d.colorAttachments.map((a) =>
+        a === null || a === undefined
+          ? undefined
+          : {
+              view: host(a.view instanceof GPUTexture ? a.view.createView() : a.view),
+              depthSlice: a.depthSlice,
+              resolveTarget: a.resolveTarget ? host(a.resolveTarget) : undefined,
+              clearValue: color(a.clearValue),
+              loadOp: a.loadOp,
+              storeOp: a.storeOp,
+            },
+      ),
+      depthStencilAttachment: ds && { ...ds, view: host(ds.view) },
+      occlusionQuerySet: undefined,
+      timestampWrites: undefined,
+      maxDrawCount: u64(d.maxDrawCount),
+      label: d.label,
+    };
+    const commands = [];
+    this.#record((encoder) => {
+      const pass = encoder.beginRenderPass(descriptor);
+      for (const command of commands) command(pass);
+      pass.end();
+    });
+    return new GPURenderPassEncoder(commands);
   }
 
   copyBufferToBuffer(source, sourceOffset, destination, destinationOffset, size) {
-    // The four-argument form (source, destination, size) is newer WebGPU.
+    // The three-argument form (source, destination, size) is newer WebGPU.
     if (destination === undefined || typeof sourceOffset !== 'number') {
       unsupported('copyBufferToBuffer without offsets');
     }
-    host(this).copyBufferToBuffer(host(source), u64(sourceOffset), host(destination), u64(destinationOffset), u64(size));
+    const args = [host(source), u64(sourceOffset), host(destination), u64(destinationOffset), u64(size)];
+    this.#record((encoder) => encoder.copyBufferToBuffer(...args));
   }
 
   copyBufferToTexture(source, destination, size) {
     const e = extentSizes(size);
-    host(this).copyBufferToTexture(texelCopyBuffer(source), texelCopyTexture(destination), {
-      width: e[0], height: e[1], depthOrArrayLayers: e[2],
-    });
+    const args = [texelCopyBuffer(source), texelCopyTexture(destination), { width: e[0], height: e[1], depthOrArrayLayers: e[2] }];
+    this.#record((encoder) => encoder.copyBufferToTexture(...args));
   }
 
   copyTextureToBuffer(source, destination, size) {
     const e = extentSizes(size);
-    host(this).copyTextureToBuffer(texelCopyTexture(source), texelCopyBuffer(destination), {
-      width: e[0], height: e[1], depthOrArrayLayers: e[2],
-    });
+    const args = [texelCopyTexture(source), texelCopyBuffer(destination), { width: e[0], height: e[1], depthOrArrayLayers: e[2] }];
+    this.#record((encoder) => encoder.copyTextureToBuffer(...args));
   }
 
   copyTextureToTexture(source, destination, size) {
     const e = extentSizes(size);
-    host(this).copyTextureToTexture(texelCopyTexture(source), texelCopyTexture(destination), {
-      width: e[0], height: e[1], depthOrArrayLayers: e[2],
-    });
+    const args = [texelCopyTexture(source), texelCopyTexture(destination), { width: e[0], height: e[1], depthOrArrayLayers: e[2] }];
+    this.#record((encoder) => encoder.copyTextureToTexture(...args));
   }
 
   clearBuffer(buffer, offset, size) {
-    host(this).clearBuffer(host(buffer), u64(offset), u64(size));
+    const args = [host(buffer), u64(offset), u64(size)];
+    this.#record((encoder) => encoder.clearBuffer(...args));
   }
 
   finish(d = {}) {
-    return new GPUCommandBuffer(host(this).finish({ label: d.label }), d.label);
+    const ops = this.#ops;
+    if (ops === null) throw new Error('webgpu shim: a command encoder is finished once');
+    this.#ops = null;
+    return new GPUCommandBuffer(ops, d.label);
   }
 }
 
-function setBindGroup(pass, index, group, offsets) {
-  const dynamic = offsets && offsets.length > 0 ? Uint32Array.from(offsets) : undefined;
-  host(pass).setBindGroup(index, group ? host(group) : undefined, dynamic, undefined, undefined);
+function dynamicOffsets(offsets) {
+  return offsets && offsets.length > 0 ? Uint32Array.from(offsets) : undefined;
 }
 
-export class GPUComputePassEncoder extends Wrapper {
+// A compute pass records commands that a flush replays into one host pass
+// shared with the passes beside it, so each carries the state it sets:
+// `state` is that host pass's current pipeline and bind groups, and a
+// command setting what is already set makes no call.
+export class GPUComputePassEncoder {
+  #commands;
+
+  constructor(commands) {
+    this.#commands = commands;
+  }
+
   setPipeline(pipeline) {
-    host(this).setPipeline(host(pipeline));
+    const p = host(pipeline);
+    this.#commands.push((pass, state) => {
+      if (state.pipeline === p) return;
+      pass.setPipeline(p);
+      state.pipeline = p;
+    });
   }
 
   setBindGroup(index, group, offsets) {
-    setBindGroup(this, index, group, offsets);
+    const g = group ? host(group) : undefined;
+    const dynamic = dynamicOffsets(offsets);
+    this.#commands.push((pass, state) => {
+      if (dynamic === undefined && g !== undefined && state.groups[index] === g) return;
+      pass.setBindGroup(index, g, dynamic, undefined, undefined);
+      state.groups[index] = dynamic === undefined ? g : undefined;
+    });
   }
 
   dispatchWorkgroups(x, y, z) {
-    host(this).dispatchWorkgroups(x, y, z);
+    this.#commands.push((pass) => pass.dispatchWorkgroups(x, y, z));
   }
 
   dispatchWorkgroupsIndirect(buffer, offset) {
-    host(this).dispatchWorkgroupsIndirect(host(buffer), u64(offset));
+    const b = host(buffer);
+    const o = u64(offset);
+    this.#commands.push((pass) => pass.dispatchWorkgroupsIndirect(b, o));
   }
 
-  end() {
-    host(this).end();
-  }
+  end() {}
 }
 
-export class GPURenderPassEncoder extends Wrapper {
+export class GPURenderPassEncoder {
+  #commands;
+
+  constructor(commands) {
+    this.#commands = commands;
+  }
+
   setPipeline(pipeline) {
-    host(this).setPipeline(host(pipeline));
+    const p = host(pipeline);
+    this.#commands.push((pass) => pass.setPipeline(p));
   }
 
   setBindGroup(index, group, offsets) {
-    setBindGroup(this, index, group, offsets);
+    const g = group ? host(group) : undefined;
+    const dynamic = dynamicOffsets(offsets);
+    this.#commands.push((pass) => pass.setBindGroup(index, g, dynamic, undefined, undefined));
   }
 
   setVertexBuffer(slot, buffer, offset, size) {
-    host(this).setVertexBuffer(slot, buffer ? host(buffer) : undefined, u64(offset), u64(size));
+    const args = [slot, buffer ? host(buffer) : undefined, u64(offset), u64(size)];
+    this.#commands.push((pass) => pass.setVertexBuffer(...args));
   }
 
   setIndexBuffer(buffer, indexFormat, offset, size) {
-    host(this).setIndexBuffer(host(buffer), indexFormat, u64(offset), u64(size));
+    const args = [host(buffer), indexFormat, u64(offset), u64(size)];
+    this.#commands.push((pass) => pass.setIndexBuffer(...args));
   }
 
   setViewport(x, y, width, height, minDepth, maxDepth) {
-    host(this).setViewport(x, y, width, height, minDepth, maxDepth);
+    this.#commands.push((pass) => pass.setViewport(x, y, width, height, minDepth, maxDepth));
   }
 
   setScissorRect(x, y, width, height) {
-    host(this).setScissorRect(x, y, width, height);
+    this.#commands.push((pass) => pass.setScissorRect(x, y, width, height));
   }
 
   setBlendConstant(c) {
-    host(this).setBlendConstant(color(c));
+    const value = color(c);
+    this.#commands.push((pass) => pass.setBlendConstant(value));
   }
 
   draw(vertexCount, instanceCount, firstVertex, firstInstance) {
-    host(this).draw(vertexCount, instanceCount, firstVertex, firstInstance);
+    this.#commands.push((pass) => pass.draw(vertexCount, instanceCount, firstVertex, firstInstance));
   }
 
   drawIndexed(indexCount, instanceCount, firstIndex, baseVertex, firstInstance) {
-    host(this).drawIndexed(indexCount, instanceCount, firstIndex, baseVertex, firstInstance);
+    this.#commands.push((pass) => pass.drawIndexed(indexCount, instanceCount, firstIndex, baseVertex, firstInstance));
   }
 
-  end() {
-    host(this).end();
-  }
+  end() {}
 }
 
 // ---- stand-ins for the browser's image and canvas ------------------------
@@ -964,6 +1097,41 @@ export class TextureCanvas {
 
   getContext(kind) {
     return kind === 'webgpu' ? this.context : null;
+  }
+}
+
+// ---- call accounting, for the timing build ------------------------------
+
+/** Per method of the shim's classes: calls and milliseconds, while
+ * `profile()` has wrapped them. */
+export const calls = new Map();
+
+/** Wraps every method of the shim's WebGPU classes to count its calls and
+ * time them. For measuring only: the wrapping costs a clock read a call. */
+export function profile() {
+  const classes = [
+    GPU, GPUAdapter, GPUDevice, GPUBuffer, GPUTexture, GPUShaderModule, GPUComputePipeline,
+    GPURenderPipeline, GPUQueue, GPUCommandEncoder, GPUComputePassEncoder, GPURenderPassEncoder,
+  ];
+  // The host calls a flush makes are counted under GPUQueue.flush.
+  for (const cls of classes) {
+    for (const name of Object.getOwnPropertyNames(cls.prototype)) {
+      const d = Object.getOwnPropertyDescriptor(cls.prototype, name);
+      if (name === 'constructor' || typeof d.value !== 'function') continue;
+      const key = `${cls.name}.${name}`;
+      const f = d.value;
+      const entry = { calls: 0, ms: 0 };
+      calls.set(key, entry);
+      cls.prototype[name] = function (...args) {
+        const t = performance.now();
+        try {
+          return f.apply(this, args);
+        } finally {
+          entry.calls += 1;
+          entry.ms += performance.now() - t;
+        }
+      };
+    }
   }
 }
 

@@ -10,7 +10,8 @@
   },
   "devDependencies": {
     "@bytecodealliance/componentize-js": "0.22.0",
-    "esbuild": "0.25.12"
+    "esbuild": "0.25.12",
+    "@bytecodealliance/componentize-js-0-19-3": "npm:@bytecodealliance/componentize-js@0.19.3"
   },
   "overrides": {
     "@bytecodealliance/preview2-shim": "0.22.0"

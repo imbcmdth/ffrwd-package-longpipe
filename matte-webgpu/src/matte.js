@@ -19,7 +19,7 @@
 
 // First: `navigator.gpu` and the WebGPU globals must exist before longpipe's
 // modules are evaluated, since one of them reads `GPUBufferUsage` at load.
-import { host, GPUTexture, TextureCanvas, TextureImage } from './webgpu.js';
+import { calls, host, profile, GPUTexture, TextureCanvas, TextureImage } from './webgpu.js';
 
 import { emit, planes } from 'ffrwd:gpu/frames@0.1.0';
 import { WebGPUBackend } from '../longpipe/src/model/backends/webgpu/index.ts';
@@ -44,6 +44,7 @@ const PRESET = {
 // How often the timing line is printed, in frames; 0 is never. Set at build
 // time (`MATTE_TIMING`), since the node takes no params.
 const TIMING_EVERY = Number(globalThis.MATTE_TIMING ?? 0);
+if (TIMING_EVERY > 0) profile();
 
 const MATTE_WGSL = /* wgsl */ `
 // The renderer's alpha, one vec4 a pixel at the frame's size with the alpha
@@ -237,7 +238,7 @@ function picture(state, index) {
 function frame(state, f) {
   const { device, timing } = state;
   const sample = TIMING_EVERY > 0 && timing.frames % TIMING_EVERY === TIMING_EVERY - 1;
-  if (sample) device.queue.onSubmittedWorkDone();
+  if (sample) device.queue.drain();
   const start = now();
 
   state.renderer.process(picture(state, f.index));
@@ -255,6 +256,9 @@ function frame(state, f) {
   pass.end();
   encoder.copyTextureToTexture({ texture: state.matte }, { texture: out }, [state.v.width, state.v.height]);
   device.queue.submit([encoder.finish()]);
+  // The frame's commands go to the host as one batch, before the texture
+  // they write is handed over.
+  device.queue.flush();
   emit('out', f.pts, f.duration, host(out));
 
   const js = now() - start;
@@ -262,10 +266,19 @@ function frame(state, f) {
   timing.js += js;
   if (sample) {
     const before = now();
-    device.queue.onSubmittedWorkDone();
+    device.queue.drain();
     timing.sampled += 1;
     timing.drainJs += js;
     timing.drainWait += now() - before;
+    if (timing.frames % (TIMING_EVERY * 8) === 0) {
+      const rows = [...calls].filter(([, e]) => e.calls > 0).sort((a, b) => b[1].ms - a[1].ms);
+      for (const [name, e] of rows.slice(0, 16)) {
+        console.error(
+          `[matte-webgpu]   ${name}: ${(e.calls / timing.frames).toFixed(1)} calls/frame, ` +
+            `${(e.ms / timing.frames).toFixed(3)} ms/frame, ${((1000 * e.ms) / e.calls).toFixed(1)} us/call`,
+        );
+      }
+    }
     console.error(
       `[matte-webgpu] ${timing.frames} frames: js ${(timing.js / timing.frames).toFixed(3)} ms/frame; ` +
         `on a drained queue js ${(timing.drainJs / timing.sampled).toFixed(3)} ms then the gpu's tail ` +
