@@ -1,0 +1,8 @@
+package ffrwd:longpipe-webgpu;
+
+/// The matte node on the sidecar's device: the node world beside
+/// `ffrwd:gpu`, which imports `wasi:webgpu` and so needs a `-gpu` grant.
+world matte {
+  include ffrwd:av/node-module@0.19.1;
+  include ffrwd:gpu/gpu-module@0.1.0;
+}

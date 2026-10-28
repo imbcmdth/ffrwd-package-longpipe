@@ -1,0 +1,3 @@
+[submodule "matte-webgpu/longpipe"]
+	path = matte-webgpu/longpipe
+	url = https://github.com/sb2702/longpipe

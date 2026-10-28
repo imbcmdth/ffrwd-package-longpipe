@@ -4,3 +4,6 @@ target/
 
 # Local development state, not package content.
 ffrwd.lock
+
+# The WebGPU spike: its sources, toolchain and longpipe's checkout.
+matte-webgpu/
