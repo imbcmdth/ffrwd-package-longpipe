@@ -227,13 +227,16 @@ async function open(v) {
     matteGroup,
     yuv,
     dispatch: [Math.ceil(width / 8), Math.ceil(height / 8)],
+    handed: [],
     timing: { frames: 0, js: 0, sampled: 0, drainJs: 0, drainWait: 0 },
   };
 }
 
-/** The frame's picture as an image longpipe's input op copies from. */
+/** The frame's picture as an image longpipe's input op copies from, and
+ * the textures the host handed over, to drop once the frame is flushed. */
 function picture(state, index) {
   const handed = planes(state.v.id, index).map((t) => GPUTexture.fromHost(t));
+  state.handed = handed;
   if (state.yuv === null) return new TextureImage(handed[0]);
   const { device, yuv } = state;
   const encoder = device.createCommandEncoder();
@@ -274,6 +277,9 @@ function frame(state, f) {
   // they write is handed over.
   device.queue.flush();
   emit('out', f.pts, f.duration, host(out));
+  // The copies that read the handed planes are submitted; the handles go.
+  for (const texture of state.handed) texture.drop();
+  state.handed = [];
 
   const js = now() - start;
   timing.frames += 1;

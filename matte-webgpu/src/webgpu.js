@@ -51,6 +51,24 @@ function describe(value) {
   return value?.constructor?.name ?? typeof value;
 }
 
+// The bindings drop an imported resource only through a FinalizationRegistry
+// they unregister it from on every method call, so a handle that has been
+// used is never dropped by them. Each class also carries a dispose method
+// that calls the host's drop (ComponentizeJS 0.19.3; 0.22 has none), and
+// the shim calls it on every object that is dead by WebGPU's own rules: an
+// encoder after `finish`, a command buffer after `submit`, a pass after
+// `end`, a buffer or texture after `destroy`. Without it the host keeps
+// an entry per object, about 4 KB a frame of longpipe's.
+const DISPOSE = Symbol.dispose || Symbol.for('dispose');
+if (typeof wg.GpuCommandEncoder.prototype[DISPOSE] !== 'function') {
+  throw new Error('webgpu shim: the bindings have no dispose on their resources; the shim cannot drop handles');
+}
+
+/** Drops a host handle the shim is done with. */
+function drop(handle) {
+  handle[DISPOSE]();
+}
+
 function unsupported(what) {
   throw new Error(`webgpu shim: ${what} is not implemented (longpipe does not call it)`);
 }
@@ -637,6 +655,7 @@ export class GPUBuffer extends Wrapper {
   destroy() {
     flushQueue();
     host(this).destroy();
+    drop(host(this));
   }
 }
 
@@ -697,6 +716,16 @@ export class GPUTexture extends Wrapper {
   destroy() {
     flushQueue();
     host(this).destroy();
+    this.drop();
+  }
+
+  /** Drops the handle and the default view made from it, once nothing
+   * recorded reads the texture: for one the host handed over, which the
+   * host keeps alive itself. */
+  drop() {
+    if (this.#view !== null) drop(host(this.#view));
+    this.#view = null;
+    drop(host(this));
   }
 }
 
@@ -793,12 +822,19 @@ export class GPUQueue extends Wrapper {
       }
       if (pass !== null) {
         pass.end();
+        drop(pass);
         pass = null;
       }
       op.run(encoder);
     }
-    if (pass !== null) pass.end();
-    host(this).submit([encoder.finish(undefined)]);
+    if (pass !== null) {
+      pass.end();
+      drop(pass);
+    }
+    const buffer = encoder.finish(undefined);
+    drop(encoder);
+    host(this).submit([buffer]);
+    drop(buffer);
   }
 
   // `on-submitted-work-done` blocks until the queue drains, and longpipe's
@@ -913,6 +949,7 @@ export class GPUCommandEncoder {
       const pass = encoder.beginRenderPass(descriptor);
       for (const command of commands) command(pass);
       pass.end();
+      drop(pass);
     });
     return new GPURenderPassEncoder(commands);
   }
