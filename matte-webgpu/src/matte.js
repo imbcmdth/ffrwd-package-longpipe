@@ -36,7 +36,7 @@ const VERSION = '0.3.0-webgpu.0';
 const TIER = 'small';
 const PRESET = {
   model: TIER,
-  dtype: 'f32',
+  dtype: globalThis.MATTE_DTYPE ?? 'f32',
   resolution: TIER_CONFIG[TIER].canvasRes,
   skipFrames: 0,
 };
@@ -52,17 +52,25 @@ if (TIMING_EVERY > 0) profile();
 // this module's own pass makes it rgba.
 const PIXEL_FORMATS = globalThis.MATTE_YUV ? ['yuv420p', 'rgba'] : ['rgba', 'yuv420p'];
 
+// The renderer's tensors hold the network's precision, so the alpha is read
+// as vec4<f32> or, in an f16 build, vec4<f16>.
+const ALPHA_DECL =
+  PRESET.dtype === 'f16'
+    ? `enable f16;
+@group(0) @binding(0) var<storage, read> alpha: array<vec4<f16>>;`
+    : '@group(0) @binding(0) var<storage, read> alpha: array<vec4<f32>>;';
+
 const MATTE_WGSL = /* wgsl */ `
 // The renderer's alpha, one vec4 a pixel at the frame's size with the alpha
 // in .r, written as rgba8unorm with the alpha in every channel.
-@group(0) @binding(0) var<storage, read> alpha: array<vec4<f32>>;
+${ALPHA_DECL}
 @group(0) @binding(1) var matte: texture_storage_2d<rgba8unorm, write>;
 
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
   let size = textureDimensions(matte);
   if (id.x >= size.x || id.y >= size.y) { return; }
-  let a = clamp(alpha[id.y * size.x + id.x].r, 0.0, 1.0);
+  let a = clamp(f32(alpha[id.y * size.x + id.x].r), 0.0, 1.0);
   textureStore(matte, vec2<i32>(id.xy), vec4<f32>(a, a, a, a));
 }
 `;

@@ -39,11 +39,14 @@ const AOT = process.env.AOT === '1';
 const BATCH = process.env.BATCH !== '0';
 // `v` taken as yuv420p first, made rgba by the module (`MATTE_YUV=1`).
 const YUV = process.env.MATTE_YUV === '1';
+// The network's precision on the device: f32 (the weight file's) or f16,
+// which longpipe's own presets use and which needs the shader-f16 feature.
+const DTYPE = process.env.MATTE_DTYPE ?? 'f32';
 
 const TIMING = Number(process.env.MATTE_TIMING ?? 0);
 const NAME =
   process.env.MATTE_NAME ??
-  ['matte', TIMING > 0 && 'timing', COMPONENTIZE === '0.22' && 'cjs022', AOT && 'aot', !BATCH && 'nobatch', YUV && 'yuv'].filter(Boolean).join('-');
+  ['matte', TIMING > 0 && 'timing', COMPONENTIZE === '0.22' && 'cjs022', AOT && 'aot', !BATCH && 'nobatch', YUV && 'yuv', DTYPE !== 'f32' && DTYPE].filter(Boolean).join('-');
 
 // As jsqr's build: StarlingMonkey imports wasi:http for `fetch` unless it
 // is off. Clocks stay: longpipe's renderer reads `performance.now()`.
@@ -77,7 +80,7 @@ async function bundle() {
     mainFields: ['module', 'main'],
     loader: { '.wgsl': 'text' },
     external: ['wasi:*', 'ffrwd:*'],
-    define: { 'globalThis.MATTE_TIMING': String(TIMING), 'globalThis.WEBGPU_SHIM_BATCH': String(BATCH), 'globalThis.MATTE_YUV': String(YUV) },
+    define: { 'globalThis.MATTE_TIMING': String(TIMING), 'globalThis.WEBGPU_SHIM_BATCH': String(BATCH), 'globalThis.MATTE_YUV': String(YUV), 'globalThis.MATTE_DTYPE': JSON.stringify(DTYPE) },
     plugins: [upstream],
     legalComments: 'inline',
     metafile: true,

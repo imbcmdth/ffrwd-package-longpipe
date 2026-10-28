@@ -13,7 +13,11 @@
 // - `request-adapter`, `request-device` and `map-async` are blocking
 //   functions in 0.0.1. The promises here are made after the call has
 //   returned, so they are already settled when the caller awaits them.
-// - `on-submitted-work-done` blocks until the queue drains, then resolves.
+// - `on-submitted-work-done` blocks until the queue drains. Its promise
+//   settles at the queue's next flush (see `GPUQueue`), and `drain()` waits
+//   at once.
+// - A host call costs microseconds, so command encoders record in JS and
+//   the queue hands the host one command buffer per flush (see `GPUQueue`).
 // - Mapped ranges cross by copy: `getMappedRange` on a buffer mapped for
 //   reading answers a copy of the bytes; on one mapped for writing (or at
 //   creation) it answers a fresh ArrayBuffer, which `unmap` writes back
@@ -22,9 +26,10 @@
 //   defined at load because longpipe reads them at module scope, where a
 //   component cannot call its imports yet. The adapter checks them against
 //   the host's own the first time one is requested.
-// - There is no canvas. `canvasContext(texture)` makes a stand-in whose
-//   `getCurrentTexture` answers the texture given, and `getPreferredCanvasFormat`
-//   is `rgba8unorm`, the format `ffrwd:gpu/frames.emit` takes.
+// - There is no canvas. `TextureCanvas` is a stand-in whose webgpu
+//   context's `getCurrentTexture` answers a texture the caller supplies,
+//   and `getPreferredCanvasFormat` is `rgba8unorm`, the format
+//   `ffrwd:gpu/frames.emit` takes.
 // - There is no ImageBitmap or VideoFrame. `TextureImage` wraps a texture
 //   of the device as an image source, and `copyExternalImageToTexture` from
 //   one is a texture-to-texture copy on the device.
@@ -336,14 +341,11 @@ const LIMIT_NAMES = [
   'maxComputeWorkgroupSizeY', 'maxComputeWorkgroupSizeZ', 'maxComputeWorkgroupsPerDimension',
 ];
 
-/** A GPUSupportedLimits: every limit read once, as numbers. The wit's
- * method names are WebGPU's with the dimension suffix lower-cased. */
+/** A GPUSupportedLimits: every limit read once, as numbers. The bindings
+ * name each method as WebGPU names the limit. */
 function limits(hostLimits) {
   const out = {};
-  for (const name of LIMIT_NAMES) {
-    const method = name.replace(/(\d)D$/, '$1D');
-    out[name] = num(hostLimits[method]());
-  }
+  for (const name of LIMIT_NAMES) out[name] = num(hostLimits[name]());
   return Object.freeze(out);
 }
 
