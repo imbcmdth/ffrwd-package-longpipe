@@ -5,14 +5,14 @@
 //   node build.mjs              the component
 //   MATTE_TIMING=60 node ...    the component printing a timing line every
 //                               60 frames
-//   LONGPIPE_WEIGHTS=<path>     the small tier's weight file (default: the
-//                               spike's copy), checked against its sha256
+//
+// The weights are not in the component: the node reads its tier's file
+// through `ffrwd:models` when it opens.
 
 import { componentize as componentize022 } from '@bytecodealliance/componentize-js';
 import { componentize as componentize0193 } from '@bytecodealliance/componentize-js-0-19-3';
 import { build } from 'esbuild';
-import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -21,10 +21,6 @@ import { stageWit } from './tools/stage-wit.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const OUT = join(here, 'build');
 const UPSTREAM = join(here, 'longpipe', 'src');
-
-// longpipe's v0.0.5 small tier, as its manifest pins it.
-const WEIGHTS = process.env.LONGPIPE_WEIGHTS ?? 'E:/projects/longpipe-spike/model_small.bin';
-const WEIGHTS_SHA256 = '56430de7da6cfd6b834753f912441fbca00ad397790e308b8dc041e5c0b03394';
 
 // Which ComponentizeJS makes the component: 0.19.3 (the default) or 0.22.0
 // (`COMPONENTIZE=0.22`). 0.22's bindings make a task record on every import
@@ -58,13 +54,6 @@ const upstream = {
   name: 'longpipe',
   setup(b) {
     b.onResolve({ filter: /^~\// }, (args) => ({ path: resolve(UPSTREAM, args.path.slice(2)) }));
-    b.onResolve({ filter: /^longpipe-weights$/ }, () => ({ path: resolve(WEIGHTS), namespace: 'weights' }));
-    b.onLoad({ filter: /.*/, namespace: 'weights' }, (args) => {
-      const bytes = readFileSync(args.path);
-      const sha = createHash('sha256').update(bytes).digest('hex');
-      if (sha !== WEIGHTS_SHA256) throw new Error(`${args.path} is sha256 ${sha}, not the small tier's ${WEIGHTS_SHA256}`);
-      return { contents: bytes, loader: 'binary' };
-    });
   },
 };
 

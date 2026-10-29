@@ -1,7 +1,8 @@
 // Stages the wit this component is built against from an ffrwd-cli
 // checkout (FFRWD_REPO, default E:/ffrwd-cli): the node world (`ffrwd:av`
 // 0.19.1), the GPU companion (`ffrwd:gpu` 0.1.0) and its dependencies,
-// `wasi:webgpu` 0.0.1 among them.
+// `wasi:webgpu` 0.0.1 among them, and the pinned-files companion
+// (`ffrwd:models` 0.1.0) the weights are read through.
 //
 // One edit is made on the way. ComponentizeJS 0.22's bindings generator
 // (js-component-bindgen 1.19.0) panics on a list whose element is a type
@@ -21,8 +22,10 @@ const sidecar = join(repo, 'sidecar');
 export function stageWit(dir = 'wit') {
   mkdirSync(join(dir, 'deps', 'ffrwd-av'), { recursive: true });
   mkdirSync(join(dir, 'deps', 'ffrwd-gpu'), { recursive: true });
+  mkdirSync(join(dir, 'deps', 'ffrwd-models'), { recursive: true });
   cpSync(join(sidecar, 'wit', 'av.wit'), join(dir, 'deps', 'ffrwd-av', 'av.wit'));
   cpSync(join(sidecar, 'wit-gpu', 'gpu.wit'), join(dir, 'deps', 'ffrwd-gpu', 'gpu.wit'));
+  cpSync(join(sidecar, 'wit-models', 'models.wit'), join(dir, 'deps', 'ffrwd-models', 'models.wit'));
   cpSync(join(sidecar, 'wit-gpu', 'deps'), join(dir, 'deps'), { recursive: true });
   const webgpu = join(dir, 'deps', 'webgpu', 'webgpu.wit');
   const text = readFileSync(webgpu, 'utf8')

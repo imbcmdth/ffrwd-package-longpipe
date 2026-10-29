@@ -1,11 +1,11 @@
 {
   "name": "ffrwd/longpipe",
-  "version": "0.2.1",
-  "description": "Lightning fast, whole-frame foreground matting with longpipe's small net.",
+  "version": "0.3.0",
+  "description": "Whole-frame foreground matting on the GPU, run by longpipe's own code, five tiers from xs to xl.",
   "license": "MIT",
   "homepage": "https://github.com/imbcmdth/ffrwd-package-longpipe",
   "capabilities": [
-    "nn"
+    "gpu"
   ],
   "dependencies": {
     "ffrwd/wasm": "0.19.1",
@@ -31,12 +31,37 @@
     "matte": "recipes/matte.sql"
   },
   "models": {
-    "matte": {
-      "repo": "imbcmdth/longpipe-onnx",
-      "revision": "466029f998008e59601a3f611aec40fa55ef3f93",
-      "file": "matting_xl_temporal_f32.onnx",
-      "sha256": "67f79a367c4014d9df631afb002c99bf6efb1aa4ae122df175b45f2f92d611b6",
-      "not_on": ["directml"]
-    }
+    "matte": [
+      {
+        "repo": "imbcmdth/longpipe-weights",
+        "revision": "2e00b99974a0e3651ea7c9c46088394e2826c5fc",
+        "file": "model_small.bin",
+        "sha256": "56430de7da6cfd6b834753f912441fbca00ad397790e308b8dc041e5c0b03394"
+      },
+      {
+        "repo": "imbcmdth/longpipe-weights",
+        "revision": "2e00b99974a0e3651ea7c9c46088394e2826c5fc",
+        "file": "model_xs.bin",
+        "sha256": "501cd8fc26a260552c62d22cde4d5ab7b32087921f42ba2539a9b5300d3f8c9d"
+      },
+      {
+        "repo": "imbcmdth/longpipe-weights",
+        "revision": "2e00b99974a0e3651ea7c9c46088394e2826c5fc",
+        "file": "model_medium.bin",
+        "sha256": "d6684cecaa1cf0570626872b89eef3690e41e3b861fc67f8916732b549d50945"
+      },
+      {
+        "repo": "imbcmdth/longpipe-weights",
+        "revision": "2e00b99974a0e3651ea7c9c46088394e2826c5fc",
+        "file": "model_large.bin",
+        "sha256": "5294fbbfd1eac70a6ee8d99dbe4de9a6d8c459d2c8a893c24402b35464e121f5"
+      },
+      {
+        "repo": "imbcmdth/longpipe-weights",
+        "revision": "2e00b99974a0e3651ea7c9c46088394e2826c5fc",
+        "file": "model_xl.bin",
+        "sha256": "c1ea11f3ff2a17eb60fe53c5d37d91c410f6d992ecb245236b21c7ef80217032"
+      }
+    ]
   }
 }

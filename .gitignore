@@ -1,7 +1,6 @@
-target/
 ffrwd.lock.bak
 ffrwd.links
 
-# The WebGPU spike's toolchain and build output.
+# The matte node's toolchain and build output.
 matte-webgpu/node_modules/
 matte-webgpu/build/

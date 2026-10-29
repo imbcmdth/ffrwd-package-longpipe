@@ -1,16 +1,17 @@
-// `matte(v)` on the sidecar's device, run by longpipe's own code: the
+// `matte(v, tier)` on the sidecar's device, run by longpipe's own code: the
 // frame's foreground as a gray matte at `v`'s size, white where the subject
 // is, black where the background is.
 //
 // longpipe's `Renderer` (src/pipeline/worker/renderer.ts) is driven as its
-// worker drives it, with the browser left out: the `small` tier from
-// longpipe's own weight file, its optical-flow stabilizer, and a background
-// colour so that every frame runs the model. A frame reaches it as the
-// texture `frames.planes` hands over (an rgba plane as it is; yuv420p planes
-// made rgba by a pass of this module's own), and the matte it composites
-// with, its upscaled alpha at the frame's size, is written into an rgba
-// texture with the alpha in every channel and handed to the host. Nothing
-// leaves the device.
+// worker drives it, with the browser left out: the tier the node opens with
+// (`small` unless `tier` names another), from longpipe's own weight file for
+// it, which the host hands over through `ffrwd:models`; its optical-flow
+// stabilizer; and a background colour so that every frame runs the model.
+// A frame reaches it as the texture `frames.planes` hands over (an rgba
+// plane as it is; yuv420p planes made rgba by a pass of this module's own),
+// and the matte it composites with, its upscaled alpha at the frame's size,
+// is written into an rgba texture with the alpha in every channel and
+// handed to the host. Nothing leaves the device.
 //
 // The renderer composites the frame over the colour into a canvas texture
 // on every frame, as it would for display. That pass is the price of
@@ -22,27 +23,41 @@
 import { calls, host, profile, GPUTexture, TextureCanvas, TextureImage } from './webgpu.js';
 
 import { emit, planes } from 'ffrwd:gpu/frames@0.1.0';
+import { names, read } from 'ffrwd:models/files@0.1.0';
 import { WebGPUBackend } from '../longpipe/src/model/backends/webgpu/index.ts';
 import { Renderer } from '../longpipe/src/pipeline/worker/renderer.ts';
 import { TIER_CONFIG } from '../longpipe/src/model/tier_config.ts';
-import weightBytes from 'longpipe-weights';
 
 import { gpuNode } from './node.js';
 
-const VERSION = '0.3.0-webgpu.0';
+const VERSION = '0.3.0';
 
-// The tier and how it runs: every frame (no skipping, as longpipe's large
-// and xl presets run), in f32, the weight file's own precision.
-const TIER = 'small';
-const PRESET = {
-  model: TIER,
-  dtype: globalThis.MATTE_DTYPE ?? 'f32',
-  resolution: TIER_CONFIG[TIER].canvasRes,
-  skipFrames: 0,
-};
+// longpipe's five tiers (its `ModelName`), smallest first, and the one the
+// node opens with when `tier` is not given. Each is read from
+// `model_<tier>.bin`, the name longpipe ships it under and the manifest pins.
+const TIERS = ['xs', 'small', 'medium', 'large', 'xl'];
+const DEFAULT_TIER = 'small';
+for (const tier of TIERS) {
+  if (TIER_CONFIG[tier] === undefined) throw new Error(`matte: longpipe has no tier '${tier}'`);
+}
+
+// The network's precision, set at build time (`MATTE_DTYPE`).
+const DTYPE = globalThis.MATTE_DTYPE ?? 'f32';
+
+// How a tier runs: every frame (no skipping, as longpipe's large and xl
+// presets run), at the tier's own canvas resolution, in the build's
+// precision (f32 by default, the weight files' own).
+function presetFor(tier) {
+  return {
+    model: tier,
+    dtype: DTYPE,
+    resolution: TIER_CONFIG[tier].canvasRes,
+    skipFrames: 0,
+  };
+}
 
 // How often the timing line is printed, in frames; 0 is never. Set at build
-// time (`MATTE_TIMING`), since the node takes no params.
+// time (`MATTE_TIMING`).
 const TIMING_EVERY = Number(globalThis.MATTE_TIMING ?? 0);
 if (TIMING_EVERY > 0) profile();
 
@@ -55,7 +70,7 @@ const PIXEL_FORMATS = globalThis.MATTE_YUV ? ['yuv420p', 'rgba'] : ['rgba', 'yuv
 // The renderer's tensors hold the network's precision, so the alpha is read
 // as vec4<f32> or, in an f16 build, vec4<f16>.
 const ALPHA_DECL =
-  PRESET.dtype === 'f16'
+  DTYPE === 'f16'
     ? `enable f16;
 @group(0) @binding(0) var<storage, read> alpha: array<vec4<f16>>;`
     : '@group(0) @binding(0) var<storage, read> alpha: array<vec4<f32>>;';
@@ -132,19 +147,33 @@ function colourOf(color) {
 
 const now = () => performance.now();
 
-/** The weight file as its own ArrayBuffer, which longpipe's loader views. */
-function weightBuffer() {
-  return weightBytes.buffer.slice(weightBytes.byteOffset, weightBytes.byteOffset + weightBytes.byteLength);
+/** The tier's weight file, read from the host, as its own ArrayBuffer, which
+ * longpipe's loader views. */
+function weightBuffer(tier) {
+  const file = `model_${tier}.bin`;
+  let bytes;
+  try {
+    bytes = read(file);
+  } catch (error) {
+    const reason = error?.payload ?? error?.message ?? String(error);
+    const bound = names();
+    const has = bound.length === 0 ? 'none' : bound.join(', ');
+    throw `matte: the ${tier} tier reads ${file}, which the host could not hand over (it has ${has}): ${reason}`;
+  }
+  if (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) return bytes.buffer;
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
 }
 
-async function open(v) {
+async function open(v, { tier }) {
+  const preset = presetFor(tier);
+  const weights = weightBuffer(tier);
   const adapter = await navigator.gpu.requestAdapter();
   if (adapter === null) throw 'matte: the sidecar answered no GPU adapter';
   const device = await adapter.requestDevice();
   const { width, height } = v;
 
   const canvas = new TextureCanvas(width, height);
-  const backend = await WebGPUBackend.create({ canvas, device, dtype: PRESET.dtype });
+  const backend = await WebGPUBackend.create({ canvas, device, dtype: preset.dtype });
   const renderer = new Renderer({
     backend,
     backendKind: 'webgpu',
@@ -153,7 +182,7 @@ async function open(v) {
     enabled: true,
     topology: { input: 'ffrwd', output: 'ffrwd' },
   });
-  renderer.setPreset(PRESET, weightBuffer());
+  renderer.setPreset(preset, weights);
 
   // The composite's target, made once and never emitted.
   canvas.context.texture = device.createTexture({
@@ -311,6 +340,9 @@ export const { node, ports } = gpuNode({
   name: 'matte',
   version: VERSION,
   pixelFormats: PIXEL_FORMATS,
+  params: {
+    tier: { choices: TIERS, fallback: DEFAULT_TIER, description: 'The model size: xs, small, medium, large or xl.' },
+  },
   // The stabilizer carries the previous frame's matte into this one.
   pure: false,
   open,

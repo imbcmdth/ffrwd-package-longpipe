@@ -1,8 +1,8 @@
 {
   "name": "ffrwd-longpipe-matte-webgpu",
-  "version": "0.0.0",
+  "version": "0.3.0",
   "private": true,
-  "description": "Spike: longpipe's own TypeScript and WGSL run as an ffrwd node on the sidecar's GPU.",
+  "description": "longpipe's own TypeScript and WGSL run as ffrwd/longpipe's matte node on the sidecar's GPU.",
   "license": "MIT",
   "type": "module",
   "scripts": {
