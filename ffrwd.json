@@ -4,6 +4,7 @@
   "description": "Whole-frame foreground matting on the GPU, run by longpipe's own code, five tiers from xs to xl.",
   "license": "MIT",
   "homepage": "https://github.com/imbcmdth/ffrwd-package-longpipe",
+  "ffrwd": ">=0.33",
   "capabilities": [
     "gpu"
   ],
